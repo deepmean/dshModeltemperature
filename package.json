@@ -28,12 +28,12 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/deepmean/dsh-per-model-temperature.git"
+    "url": "git+https://github.com/deepmean/dshModeltemperature.git"
   },
   "bugs": {
-    "url": "https://github.com/deepmean/dsh-per-model-temperature/issues"
+    "url": "https://github.com/deepmean/dshModeltemperature/issues"
   },
-  "homepage": "https://github.com/deepmean/dsh-per-model-temperature#readme",
+  "homepage": "https://github.com/deepmean/dshModeltemperature#readme",
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"
