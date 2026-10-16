@@ -1,6 +1,7 @@
 {
   "name": "dsh-per-model-temperature",
   "version": "1.1.0",
+  "private": true,
   "type": "module",
   "description": "Per-model temperature for hand-declared llm-pi-ai providers: a settings page plus an agent/request listener that puts the configured temperature on the wire.",
   "keywords": [

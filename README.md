@@ -50,15 +50,19 @@ const proposedConfig = await this.dispatch.waterfall(
 
 ## 安装
 
+> **这个包不在 npm 上，也不打算上。** `package.json` 里是 `"private": true`，
+> 分发方式是 clone 仓库 + 本地 `file:` 安装。
+
 ```bash
-dsh plugin --profile web add "file:/绝对路径/dsh-per-model-temperature"
+git clone https://github.com/deepmean/dshModeltemperature.git
+dsh plugin --profile web add "file:/绝对路径/dshModeltemperature"
 ```
 
 或者手工两步：
 
 1. 在 profile 的 `package.json` 里加依赖：
    ```json
-   { "dependencies": { "dsh-per-model-temperature": "file:/绝对路径/dsh-per-model-temperature" } }
+   { "dependencies": { "dsh-per-model-temperature": "file:/绝对路径/dshModeltemperature" } }
    ```
 2. 把它加进 `dsh.profile.bundles` 数组（顺序即加载顺序）。
 
