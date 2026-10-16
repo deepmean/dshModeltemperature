@@ -1,0 +1,8 @@
+# 仓库里统一 LF：这几个文件是给 Node 和 dsh 直接读的，
+# 行尾一变，本地副本与仓库副本的哈希就对不上了。
+* text=auto eol=lf
+
+# 二进制
+*.png binary
+*.jpg binary
+*.ico binary

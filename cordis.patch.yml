@@ -1,0 +1,8 @@
+# dsh-per-model-temperature bundle layer.
+#
+# One row mounts the host half, which registers the `per-model-temperature`
+# settings namespace and the `agent/request` listener that applies the
+# configured temperature to that exact provider/model request.
+- insert:
+    - id: per-model-temperature
+      name: dsh-per-model-temperature

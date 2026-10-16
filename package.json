@@ -1,0 +1,62 @@
+{
+  "name": "dsh-per-model-temperature",
+  "version": "1.1.0",
+  "type": "module",
+  "description": "Per-model temperature for hand-declared llm-pi-ai providers: a settings page plus an agent/request listener that puts the configured temperature on the wire.",
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "temperature",
+    "llm-pi-ai",
+    "settings"
+  ],
+  "main": "./index.js",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "cordis.patch.yml",
+    "scripts"
+  ],
+  "scripts": {
+    "test": "node scripts/test-temperature-client.mjs && node scripts/probe-apply-temperature.mjs && node scripts/probe-live-record.mjs"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/deepmean/dsh-per-model-temperature.git"
+  },
+  "bugs": {
+    "url": "https://github.com/deepmean/dsh-per-model-temperature/issues"
+  },
+  "homepage": "https://github.com/deepmean/dsh-per-model-temperature#readme",
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-settings",
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-ui-slots"
+      ]
+    }
+  },
+  "peerDependencies": {
+    "@deepseek-ai/dsh": ">=0.2.0"
+  },
+  "peerDependenciesMeta": {
+    "@deepseek-ai/dsh": {
+      "optional": true
+    }
+  },
+  "dependencies": {
+    "@deepseek-ai/schemastery": "3.18.5-alpha.2"
+  },
+  "license": "MIT"
+}
