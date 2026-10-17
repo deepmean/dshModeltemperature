@@ -97,6 +97,23 @@ export function applyTemperature(entries, config) {
  * @param ctx - the plugin context; `ctx.settings` must be available.
  */
 export function apply(ctx) {
+  /**
+   * Fail with the actual cause, not a bare TypeError.
+   *
+   * `ctx.settings` is upstream, but `register()` is NOT: dsh 0.2.1-alpha.5's
+   * settings service only exposes the new volatile-Config form model, and this
+   * legacy method is put back by the dsh-purge patch #42 (SETTINGS_LEGACY_API).
+   * A dsh update overwrites `node_modules` and takes it away silently, after
+   * which `ctx.settings.register(...)` throws "is not a function" — a message
+   * that says nothing about why or what to do.
+   */
+  if (typeof ctx.settings?.register !== 'function') {
+    throw new Error(
+      'per-model-temperature: ctx.settings.register() is missing. This plugin uses the legacy settings API, '
+      + 'which upstream dsh no longer ships; the dsh-purge patch #42 (SETTINGS_LEGACY_API) restores it. '
+      + 'Re-apply the purge patches, restart dsh, then diagnose with: node scripts/check-compat.mjs',
+    )
+  }
   const scope = ctx.settings.register(NAMESPACE, settingsSchema)
   ctx.on('agent/request', async (_payload, next) => {
     const config = await next()

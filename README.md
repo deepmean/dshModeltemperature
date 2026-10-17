@@ -70,6 +70,43 @@ dsh plugin --profile web add "file:/绝对路径/dshModeltemperature"
 
 ---
 
+## 更新 dsh 之后（必读）
+
+**每次 `dsh` 更新完，先跑这个：**
+
+```bash
+node scripts/check-compat.mjs
+```
+
+一条命令查 20 项，覆盖本插件依赖的每一个上游接口。全绿才算好；有红它会直接告诉你该做什么。
+
+### 为什么需要这一步
+
+本插件站在一条**上游并不保证**的缝上：老式 settings API，也就是 `ctx.settings.register()`。
+
+- dsh `0.2.1-alpha.5` 起，上游的 `dsh-settings` 只剩**新式表单模型**（插件自己的 volatile Config），**`register()` 已经不在上游代码里了**；
+- 本机是靠 **`dsh-purge` 的 #42 号补丁 `SETTINGS_LEGACY_API`** 把它加回来的 —— 该补丁不仅补回 `register()`，还把 legacy 命名空间接进了 `describe()`（客户端读表单）和 `mutate()`（客户端写表单）。
+
+于是就有了这个失败模式：
+
+```
+dsh update  →  覆盖 node_modules 里的文件  →  补丁被冲掉
+           →  ctx.settings.register 变成 undefined
+           →  插件的 apply() 抛 TypeError
+           →  服务端监听器没挂上、设置页没有数据源
+           →  表现：插件「失效」，不报错、不崩溃、没日志
+```
+
+### 怎么修
+
+1. **重新打补丁** —— `dsh-purge` 的 `purge_apply`（#42 等）；
+2. **重启 dsh** —— 补丁改的是磁盘文件，运行中的进程还持有旧模块，必须重启才吃得到；
+3. `node scripts/check-compat.mjs` 确认全绿。
+
+`check-compat.mjs` 的最后一条专门验这个：**运行中的 dsh 进程启动时间是否晚于补丁写入时间**。补丁打了但没重启，这条会红。
+
+---
+
 ## 用法
 
 设置页里会多出一节 **per-model-temperature**。每一行三个下拉：
@@ -115,19 +152,21 @@ dsh 自带 HMR（`dsh-base/cordis.patch.yml` 里的 `hmr` 行，web 部署下默
 
 ## 测试
 
-三个脚本，都不需要浏览器：
+四个脚本，都不需要浏览器：
 
 ```bash
-node scripts/test-temperature-client.mjs   # 60 通过 / 0 失败
-node scripts/probe-apply-temperature.mjs   # 15 passed, 0 failed
-node scripts/probe-live-record.mjs         # 15 passed, 0 failed
+node scripts/check-compat.mjs             # 20 passed, 0 failed  ← dsh 更新后先跑这个
+node scripts/test-temperature-client.mjs  # 60 通过 / 0 失败
+node scripts/probe-apply-temperature.mjs  # 15 passed, 0 failed
+node scripts/probe-live-record.mjs        # 15 passed, 0 failed
 ```
 
+- **`check-compat.mjs`** —— 兼容性哨兵。逐条验上游接口：`dsh-settings` 的 legacy API 是否在（**本次失效的根因**）、`describe()`/`mutate()` 是否接了 legacy 命名空间、`agent/request` waterfall 是否还在、`temperature` 能否活着穿过 `resolveCallWithInfo` 与 pi-ai 转发层、配置数据是否还在、磁盘副本是否与源码一致、**运行中的 dsh 是否启动于补丁之后**。断了会直接给出该做什么。
 - **`test-temperature-client.mjs`** —— 用最小 React 桩把 `client.js` 真跑起来。覆盖「点添加没反应」、「三个字段都是下拉」、「换提供商必须清空模型」、「自定义标记不能串行」、「点菜单滚动条不能把菜单关掉」等曾经真踩过的坑。
 - **`probe-apply-temperature.mjs`** —— 把**已安装的那份** `index.js` 当真模块 import 进来，驱动真实的 `apply()` 监听器，验命中/不命中/多行并存/不改写入参。
 - **`probe-live-record.mjs`** —— 端到端：用 **harness 自己的 yaml 解析器**读真实的 `settings-legacy.yaml`，过**真实的 `settingsSchema`**，再进真实监听器，证明磁盘上那条记录真的会变成发出去的 `temperature`。
 
-两个探针优先读**已安装副本**（`$DSH_HOME/profiles/<profile>/node_modules/...`），读不到才回退到源码目录；可以用 `DSH_HOME` / `DSH_PROFILE_DIR` / `DSH_PACKAGE` 环境变量指到别的部署。
+`npm test` 会把四个一起跑。三个探针优先读**已安装副本**（`$DSH_HOME/profiles/<profile>/node_modules/...`），读不到才回退到源码目录；可以用 `DSH_HOME` / `DSH_PROFILE_DIR` / `DSH_PACKAGE` 环境变量指到别的部署。
 
 ---
 

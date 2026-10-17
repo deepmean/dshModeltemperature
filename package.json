@@ -25,7 +25,7 @@
     "scripts"
   ],
   "scripts": {
-    "test": "node scripts/test-temperature-client.mjs && node scripts/probe-apply-temperature.mjs && node scripts/probe-live-record.mjs"
+    "test": "node scripts/check-compat.mjs && node scripts/test-temperature-client.mjs && node scripts/probe-apply-temperature.mjs && node scripts/probe-live-record.mjs"
   },
   "repository": {
     "type": "git",
