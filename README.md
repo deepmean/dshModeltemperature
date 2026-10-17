@@ -1,4 +1,4 @@
-# dsh-per-model-temperature
+﻿# dsh-per-model-temperature
 
 给 [DeepSeek Harness](https://github.com/deepseek-ai/dsh) 用的**按模型温度**插件：在设置页里给每一条 `llm-pi-ai` 路由的每个模型单独配一个 `temperature`，并在请求真正发出去之前把它塞进去。
 
@@ -53,6 +53,8 @@ const proposedConfig = await this.dispatch.waterfall(
 > **这个包不在 npm 上，也不打算上。** `package.json` 里是 `"private": true`，
 > 分发方式是 clone 仓库 + 本地 `file:` 安装。
 
+**新环境**（首次安装）：
+
 ```bash
 git clone https://github.com/deepmean/dshModeltemperature.git
 dsh plugin --profile web add "file:/绝对路径/dshModeltemperature"
@@ -68,6 +70,33 @@ dsh plugin --profile web add "file:/绝对路径/dshModeltemperature"
 
 插件自带 `cordis.patch.yml`，装载时会插入自己的配置行，不用你再写一遍。
 
+### 源码目录与「改完即生效」
+
+本仓库就是**安装源**。怎么让改动生效，取决于当初怎么装的：
+
+| 装法 | 机制 | 之后再改源码 |
+|---|---|---|
+| `dsh plugin add file:<源>` | pnpm 把文件**复制**进 `.pnpm` 存储，再在 `node_modules` 建符号链接 | ❌ **不会自动同步**，得重新装一次 |
+| `node_modules` 里放**目录联接**指向源目录 | Node 穿透解析到真实路径 | ✅ **立刻生效**，改完刷新页面/重启即可 |
+
+两种都行。想要「改完即生效」，用联接：
+
+```powershell
+# 先删掉 pnpm 装出来的那份，再建联接
+$nm = "$env:USERPROFILE\.dsh\profiles\web\node_modules\dsh-per-model-temperature"
+Remove-Item $nm -Recurse -Force
+New-Item -ItemType Junction -Path $nm -Target "C:\llmProj\modelConfig\dsh-per-model-temperature"
+```
+
+**⚠️ 用联接有个前提**：Node 会从**真实路径**（而不是联接路径）往上找依赖，所以源目录**必须自带 `node_modules`**，否则 `@deepseek-ai/schemastery` 解析不到、插件加载直接失败：
+
+```powershell
+cd C:\llmProj\modelConfig\dsh-per-model-temperature
+npm install --omit=dev
+```
+
+（`node_modules/` 已在 `.gitignore` 里，不会进仓库。）
+
 ---
 
 ## 更新 dsh 之后（必读）
@@ -78,7 +107,7 @@ dsh plugin --profile web add "file:/绝对路径/dshModeltemperature"
 node scripts/check-compat.mjs
 ```
 
-一条命令查 20 项，覆盖本插件依赖的每一个上游接口。全绿才算好；有红它会直接告诉你该做什么。
+一条命令查 23 项，覆盖本插件依赖的每一个上游接口。全绿才算好；有红它会直接告诉你该做什么。
 
 ### 为什么需要这一步
 
@@ -155,7 +184,7 @@ dsh 自带 HMR（`dsh-base/cordis.patch.yml` 里的 `hmr` 行，web 部署下默
 四个脚本，都不需要浏览器：
 
 ```bash
-node scripts/check-compat.mjs             # 20 passed, 0 failed  ← dsh 更新后先跑这个
+node scripts/check-compat.mjs             # 23 passed, 0 failed  ← dsh 更新后先跑这个
 node scripts/test-temperature-client.mjs  # 60 通过 / 0 失败
 node scripts/probe-apply-temperature.mjs  # 15 passed, 0 failed
 node scripts/probe-live-record.mjs        # 15 passed, 0 failed

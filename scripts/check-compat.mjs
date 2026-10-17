@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env node
+#!/usr/bin/env node
 /**
  * modelConfig / dsh-per-model-temperature / scripts/check-compat.mjs
  *
@@ -203,6 +203,52 @@ for (const f of ['index.js', 'client.js', 'package.json', 'cordis.patch.yml']) {
   const same = fs.existsSync(src) && fs.existsSync(dst)
     && fs.readFileSync(src).equals(fs.readFileSync(dst))
   check(`已安装副本与源码一致：${f}`, same, same ? '' : '副本是旧的', '把文件复制进 profile 的 node_modules，然后重启 dsh。')
+}
+
+// ─────────────────────────────────────────────────────────────
+// 6b. 从「已安装路径」真的 import 一次
+//
+// 这条是 2026-10-17 那次事故换来的：node_modules 换成指向源码目录的
+// **目录联接**之后，Node 会穿透到**真实路径**并在那里往上找 node_modules，
+// 而源码目录当时没有自己的 node_modules —— `@deepseek-ai/schemastery`
+// 解析不到，插件加载直接失败。前面「逐字节一致」那几条全绿也照样漏掉它，
+// 因为文件确实是同一份，坏的是**依赖解析**。
+//
+// 所以这里必须走一遍真实的 import：那才是 dsh 启动时干的事。
+// ─────────────────────────────────────────────────────────────
+const installedEntry = path.join(INSTALLED, 'index.js')
+if (!fs.existsSync(installedEntry)) {
+  check('从已安装路径 import 插件', false, '找不到 index.js')
+} else {
+  let realPath = null
+  try {
+    realPath = fs.realpathSync(installedEntry)
+  } catch { /* 下面报 */ }
+  const isLink = realPath !== null && realPath !== installedEntry
+  let imported = null
+  let importError = ''
+  try {
+    imported = await import(pathToFileURL(installedEntry).href)
+  } catch (error) {
+    importError = error.message
+  }
+  check(
+    '从已安装路径 import 插件（dsh 启动时走的就是这条）',
+    imported !== null,
+    imported !== null ? `apply=${typeof imported.apply} schema=${typeof imported.settingsSchema}` : importError,
+    isLink
+      ? 'node_modules 是指向源码目录的链接，所以源码目录必须自带 node_modules 才能解析依赖：cd <源码目录> && npm install --omit=dev'
+      : '检查插件依赖是否装全。',
+  )
+  if (imported !== null) {
+    check('插件导出 apply 与 settingsSchema', typeof imported.apply === 'function' && typeof imported.settingsSchema === 'function')
+  }
+  rows.push({
+    label: 'node_modules 的挂载方式',
+    ok: true,
+    detail: isLink ? `链接 → ${realPath}` : '实体副本',
+    fix: '',
+  })
 }
 
 // ─────────────────────────────────────────────────────────────
