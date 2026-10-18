@@ -1,4 +1,4 @@
-﻿# dsh-per-model-temperature
+# dsh-per-model-temperature
 
 给 [DeepSeek Harness](https://github.com/deepseek-ai/dsh) 用的**按模型温度**插件：在设置页里给每一条 `llm-pi-ai` 路由的每个模型单独配一个 `temperature`，并在请求真正发出去之前把它塞进去。
 
@@ -88,6 +88,12 @@ Remove-Item $nm -Recurse -Force
 New-Item -ItemType Junction -Path $nm -Target "C:\llmProj\modelConfig\dsh-per-model-temperature"
 ```
 
+或者直接用脚本，它把上面这些连依赖检查、失败回滚一起做了：
+
+```bash
+node scripts/relink.mjs
+```
+
 **⚠️ 用联接有个前提**：Node 会从**真实路径**（而不是联接路径）往上找依赖，所以源目录**必须自带 `node_modules`**，否则 `@deepseek-ai/schemastery` 解析不到、插件加载直接失败：
 
 ```powershell
@@ -130,9 +136,34 @@ dsh update  →  覆盖 node_modules 里的文件  →  补丁被冲掉
 
 1. **重新打补丁** —— `dsh-purge` 的 `purge_apply`（#42 等）；
 2. **重启 dsh** —— 补丁改的是磁盘文件，运行中的进程还持有旧模块，必须重启才吃得到；
-3. `node scripts/check-compat.mjs` 确认全绿。
+3. **恢复链接**（用联接方案的话）—— 更新会重跑安装，把链接换成副本：
+   ```bash
+   node scripts/relink.mjs
+   ```
+4. `node scripts/check-compat.mjs` 确认全绿。
 
 `check-compat.mjs` 的最后一条专门验这个：**运行中的 dsh 进程启动时间是否晚于补丁写入时间**。补丁打了但没重启，这条会红。
+
+### 为什么链接会被冲掉
+
+profile 用 `file:` 依赖装这个插件，pnpm 的做法是**复制**源目录。于是每次 `dsh update` 都会重跑安装：
+
+```
+你把 node_modules 建成指向源目录的联接（想要「改完即生效」）
+        ↓
+dsh update → pnpm 重新安装 → 联接被真实副本覆盖
+        ↓
+改动不再同步 —— 而且无声无息，没有任何报错
+```
+
+`relink.mjs` 就是干这个的：检测并恢复，幂等、可 dry-run。
+
+```bash
+node scripts/relink.mjs            # 检查并在需要时重建
+node scripts/relink.mjs --dry-run  # 只看会做什么
+```
+
+它会先确认**源目录自带 `node_modules`**（链接生效后 Node 从真实路径找依赖，缺了会加载失败），换链接前把旧目录挪成 `.pmt-copy-backup`，建好后再真 import 一次验证；任一步失败会自动回滚。
 
 ---
 
@@ -185,6 +216,7 @@ dsh 自带 HMR（`dsh-base/cordis.patch.yml` 里的 `hmr` 行，web 部署下默
 
 ```bash
 node scripts/check-compat.mjs             # 23 passed, 0 failed  ← dsh 更新后先跑这个
+node scripts/relink.mjs                   # 更新后若变成实体副本，用它接回源目录
 node scripts/test-temperature-client.mjs  # 60 通过 / 0 失败
 node scripts/probe-apply-temperature.mjs  # 15 passed, 0 failed
 node scripts/probe-live-record.mjs        # 15 passed, 0 failed
@@ -194,6 +226,7 @@ node scripts/probe-live-record.mjs        # 15 passed, 0 failed
 - **`test-temperature-client.mjs`** —— 用最小 React 桩把 `client.js` 真跑起来。覆盖「点添加没反应」、「三个字段都是下拉」、「换提供商必须清空模型」、「自定义标记不能串行」、「点菜单滚动条不能把菜单关掉」等曾经真踩过的坑。
 - **`probe-apply-temperature.mjs`** —— 把**已安装的那份** `index.js` 当真模块 import 进来，驱动真实的 `apply()` 监听器，验命中/不命中/多行并存/不改写入参。
 - **`probe-live-record.mjs`** —— 端到端：用 **harness 自己的 yaml 解析器**读真实的 `settings-legacy.yaml`，过**真实的 `settingsSchema`**，再进真实监听器，证明磁盘上那条记录真的会变成发出去的 `temperature`。
+- **`relink.mjs`** —— 把 `node_modules` 里那份插件接回源目录。dsh 更新会重跑安装、把链接换成副本，跑它恢复。「改完即生效」靠的就是这个链接。
 
 `npm test` 会把四个一起跑。三个探针优先读**已安装副本**（`$DSH_HOME/profiles/<profile>/node_modules/...`），读不到才回退到源码目录；可以用 `DSH_HOME` / `DSH_PROFILE_DIR` / `DSH_PACKAGE` 环境变量指到别的部署。
 

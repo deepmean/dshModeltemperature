@@ -246,7 +246,10 @@ if (!fs.existsSync(installedEntry)) {
   rows.push({
     label: 'node_modules 的挂载方式',
     ok: true,
-    detail: isLink ? `链接 → ${realPath}` : '实体副本',
+    // 实体副本照样能跑，所以这里不算失败；但它意味着「改完即生效」没了。
+    detail: isLink
+      ? `链接 → ${realPath}（改源目录即改线上）`
+      : '实体副本 —— 改源目录不会同步，跑 node scripts/relink.mjs 换成链接',
     fix: '',
   })
 }
