@@ -209,6 +209,54 @@ window.__ModuleLoader__.load({
     }
 
     /**
+     * Union of the live registry and the static section, live winning.
+     *
+     * Shapes it accepts (both are what the remote answers, and both are treated
+     * as optional so a half-answer still helps):
+     *
+     *   providers : [{ id, name }]                      ← llm/listProviders
+     *   models    : { groups: [{ id, models: [{ id }] }] } ← session/modelCatalog
+     *
+     * `groups` is only used to fill in models for routes we already offer. A
+     * group id that matches nothing is ignored rather than invented into a
+     * route, because guessing a provider from a catalog grouping would put
+     * entries in the picker that cannot be selected downstream.
+     */
+    function mergeRoutes(staticRoutes, live) {
+      const byId = new Map()
+      for (const route of staticRoutes) {
+        byId.set(route.id, { id: route.id, models: [...route.models], name: route.id })
+      }
+      const providers = live === undefined || live === null ? undefined : live.providers
+      if (Array.isArray(providers)) {
+        for (const provider of providers) {
+          if (provider === null || typeof provider !== 'object') continue
+          if (typeof provider.id !== 'string' || provider.id === '') continue
+          const name = typeof provider.name === 'string' && provider.name !== '' ? provider.name : provider.id
+          const existing = byId.get(provider.id)
+          if (existing === undefined) byId.set(provider.id, { id: provider.id, models: [], name })
+          else existing.name = name
+        }
+      }
+      const catalog = live === undefined || live === null ? undefined : live.models
+      if (catalog !== null && typeof catalog === 'object' && Array.isArray(catalog.groups)) {
+        for (const group of catalog.groups) {
+          if (group === null || typeof group !== 'object') continue
+          if (typeof group.id !== 'string') continue
+          const route = byId.get(group.id)
+          if (route === undefined || !Array.isArray(group.models)) continue
+          for (const model of group.models) {
+            if (model === null || typeof model !== 'object') continue
+            if (typeof model.id !== 'string' || model.id === '') continue
+            if (!route.models.includes(model.id)) route.models.push(model.id)
+          }
+          route.models.sort()
+        }
+      }
+      return [...byId.values()].sort((a, b) => a.id.localeCompare(b.id))
+    }
+
+    /**
      * Dropdown. Deliberately NOT a native <select>.
      *
      * A native popup is drawn by the browser, and a mousedown that lands on
@@ -310,6 +358,19 @@ window.__ModuleLoader__.load({
       const t = props.t
       const scope = props.scope
       const llmScope = props.llmScope
+      /**
+       * The live route/model directory, read over the remote API.
+       *
+       * The static `llm-pi-ai` config alone is not the whole world: plugins
+       * register their own adapters at runtime with `llm.registerAdapter()`
+       * (dsh-our-free-model registers `our-free-model` and
+       * `our-free-model-region`, @opencode2dsh/dsh-plugin registers
+       * `opencode2dsh`). Those routes never appear in the config section, so a
+       * dropdown built from it silently cannot offer them — the user sees a
+       * temperature page that simply lacks the provider they are running on.
+       * `llm/listProviders` answers from the registry, so it includes them.
+       */
+      const [live, setLive] = react.useState(() => ({ providers: null, models: null }))
 
       const [snapshot, setSnapshot] = react.useState(() => scope.getSnapshot())
       const [rows, setRows] = react.useState(() => rowsOf(scope.getSnapshot()))
@@ -324,6 +385,34 @@ window.__ModuleLoader__.load({
        * wiped the moment the settings echo rewrites that row.
        */
       const [openKey, setOpenKey] = react.useState(null)
+
+      /**
+       * Load the live directory once.
+       *
+       * `getRemote` is a getter rather than the service itself so a late-mounted
+       * remote still resolves, and every read is optional: a deployment without
+       * it, or a call that fails, leaves the static section as the only source.
+       * The page must never depend on this working.
+       */
+      react.useEffect(() => {
+        const remote = typeof props.getRemote === 'function' ? props.getRemote() : undefined
+        if (remote === undefined || remote === null) return undefined
+        let mounted = true
+        const read = async () => {
+          const next = { providers: null, models: null }
+          try {
+            const answer = await remote.llm.listProviders()
+            if (answer !== null && typeof answer === 'object' && answer.ok === true) next.providers = answer.value
+          } catch { /* 静态配置兜底 */ }
+          try {
+            const answer = await remote.session.modelCatalog()
+            if (answer !== null && typeof answer === 'object' && answer.ok === true) next.models = answer.value
+          } catch { /* 静态配置兜底 */ }
+          if (mounted) setLive(next)
+        }
+        void read()
+        return () => { mounted = false }
+      }, [props.getRemote])
 
       react.useEffect(() => scope.subscribe(() => {
         setSnapshot(scope.getSnapshot())
@@ -346,9 +435,26 @@ window.__ModuleLoader__.load({
         const next = scope.getSnapshot()
         if (next !== undefined && next !== null) setRows(rowsOf(next))
       }, [scope, hasDraft, revision])
-      const routes = routesOf(llmSnapshot)
+      /**
+       * Routes offered by the picker.
+       *
+       * Two sources, because the static `llm-pi-ai` section is NOT the whole
+       * world. Plugins register their own adapters at runtime with
+       * `llm.registerAdapter()`:
+       *
+       *   dsh-our-free-model      → `our-free-model`, `our-free-model-region`
+       *   @opencode2dsh/dsh-plugin → `opencode2dsh`
+       *
+       * Those routes never appear in the config section, so a static-only list
+       * silently cannot offer the provider the user is actually running on —
+       * they open this page and the dropdown simply lacks it. `llm/listProviders`
+       * answers from the live registry, so it includes them; the static section
+       * stays as the fallback for a deployment without the remote service.
+       */
+      const routes = mergeRoutes(routesOf(llmSnapshot), live)
       const routeIds = routes.map((route) => route.id)
-      const routesAvailable = llmSnapshot !== undefined && llmSnapshot !== null && llmSnapshot.status === 'ready'
+      // Any route we can offer is enough; only warn when there is nothing at all.
+      const routesAvailable = routes.length > 0
       const modelsFor = (provider) => {
         const route = routes.find((candidate) => candidate.id === provider)
         return route === undefined ? [] : route.models
@@ -566,6 +672,13 @@ window.__ModuleLoader__.load({
       const t = ctx.locale.bind(NS)
       const scope = ctx.configForms.get(NS)
       const llmScope = ctx.configForms.get(LLM_NS)
+      /**
+       * The live route registry, resolved lazily through `ctx.get` rather than
+       * declared in `inject`: `remote` may mount after this plugin, and a hard
+       * dependency on it would take the whole page down on a deployment without
+       * api-remotes. The page falls back to the static section instead.
+       */
+      const getRemote = () => (typeof ctx.get === 'function' ? ctx.get('remote') : undefined)
       ctx.effect(() => ctx.locale.register(NS, { zh, en }), 'per-model-temperature: copy dictionaries')
       ctx.effect(
         () => ctx.slots.inject('settings.section', () => ctx.slots.register({
@@ -573,7 +686,7 @@ window.__ModuleLoader__.load({
           id: 'per-model-temperature',
           order: 21,
           label: () => ctx.locale.bind(NS)('nav'),
-          inject: () => ({ t, scope, llmScope }),
+          inject: () => ({ t, scope, llmScope, getRemote }),
         }, TemperatureSection)),
         'per-model-temperature: settings page',
       )

@@ -110,6 +110,8 @@ const LLM_SECTION = {
 const react = createReactStub()
 let scope
 let llmScope
+/** Live route registry stub; undefined models a deployment without api-remotes. */
+let remote
 let registered
 let bundle
 let tree = null
@@ -122,6 +124,20 @@ const ctx = {
     register: (_spec, component) => component,
   },
   effect: (fn) => { fn(); return () => {} },
+  get: (name) => (name === 'remote' ? remote : undefined),
+}
+
+/**
+ * The live directory the real remote answers:
+ *   llm/listProviders      → [{ id, name }]
+ *   session/modelCatalog   → { groups: [{ id, models: [{ id }] }] }
+ * Both wrapped in the `{ ok, value }` envelope the transport returns.
+ */
+function createRemote(providers, groups) {
+  return {
+    llm: { listProviders: async () => ({ ok: true, value: providers }) },
+    session: { modelCatalog: async () => ({ ok: true, value: { groups } }) },
+  }
 }
 
 const sandbox = {
@@ -147,15 +163,20 @@ const api = bundle.factory(sandbox.require)
 check('导出 apply 与 inject', typeof api.apply === 'function' && Array.isArray(api.inject))
 
 // ---------------------------------------------------------------- 渲染工具
+/** Stable reference, like the one `apply` closes over — a new arrow per render
+ *  would change the effect's deps and re-run the directory read every render. */
+const getRemote = () => remote
+
 function render() {
   react.__rerender()
-  tree = registered({ t: (key) => key, scope, llmScope })
+  tree = registered({ t: (key) => key, scope, llmScope, getRemote })
   return tree
 }
 /** Fresh component instance (new hook state) for a new scenario. */
-function mount(nextScope, nextLlmScope) {
+function mount(nextScope, nextLlmScope, nextRemote) {
   scope = nextScope
   llmScope = nextLlmScope
+  remote = nextRemote
   react.__reset()
   api.apply(ctx)
   return render()
@@ -283,7 +304,16 @@ async function click(node) {
   node.props.onClick()
   return settle()
 }
-const rowsState = () => react.slots[HOOK.ROWS] ?? []
+/**
+ * The rows slot, found by shape rather than index: adding a `useState` above
+ * the others shifts every slot, and an index-keyed helper then silently reads
+ * the wrong value (it reported "no rows" while four were rendered).
+ */
+const rowsState = () => {
+  const slot = react.slots.find((value) => Array.isArray(value)
+    && value.every((row) => row !== null && typeof row === 'object' && 'provider' in row && 'model' in row))
+  return slot ?? []
+}
 
 // ================================================================ 场景 1
 console.log('\n--- 场景 1：空表点「添加一行」（原 bug） ---')
@@ -491,6 +521,78 @@ check(
   find(tree, 'dshtmp-menu').length === 0,
   `实际 ${find(tree, 'dshtmp-menu').length}`,
 )
+
+// ================================================================ 场景 15
+console.log('\n--- 场景 15：运行时注册的路由（our-free-model / opencode2dsh）也要能选 ---')
+// 这两个插件用 ctx.llm.registerAdapter() 在运行时注册自己的适配器，
+// 它们的路由**不在** llm-pi-ai 的静态 providers 段里。只读静态配置的下拉
+// 会悄悄漏掉它们 —— 用户在设置页里根本选不到自己正在用的提供商。
+const LIVE_REMOTE = createRemote(
+  [
+    { id: 'our-free-model', name: 'Our Free Model' },
+    { id: 'our-free-model-region', name: 'Our Free Model · region-limited' },
+    { id: 'opencode2dsh', name: 'opencode2dsh' },
+  ],
+  [
+    { id: 'our-free-model', models: [{ id: 'deepseek-v4.1-flash-free' }] },
+    { id: 'opencode2dsh', models: [{ id: 'opencode-model-a' }, { id: 'opencode-model-b' }] },
+  ],
+)
+mount(createScope({ entries: [] }), createScope(LLM_SECTION), LIVE_REMOTE)
+await settle()
+await click(buttonByLabel('add'))
+
+const liveProviders = await optionLabels(0, 0)
+check(
+  '下拉里出现 our-free-model',
+  liveProviders.includes('our-free-model'),
+  liveProviders.join('|'),
+)
+check(
+  '下拉里出现 our-free-model-region',
+  liveProviders.includes('our-free-model-region'),
+  liveProviders.join('|'),
+)
+check(
+  '下拉里出现 opencode2dsh',
+  liveProviders.includes('opencode2dsh'),
+  liveProviders.join('|'),
+)
+check(
+  '静态配置的路由没被挤掉',
+  ['wbproxy-intl', 'dola2api', 'justwoker', 'openrouter'].every((r) => liveProviders.includes(r)),
+  liveProviders.join('|'),
+)
+
+await pickOption(0, 0, 'our-free-model')
+const liveModels = await optionLabels(0, 1)
+check(
+  '选 our-free-model 后模型来自活目录',
+  liveModels.includes('deepseek-v4.1-flash-free'),
+  liveModels.join('|'),
+)
+
+await pickOption(0, 1, 'deepseek-v4.1-flash-free')
+const liveWritten = scope.calls.at(-1)?.value ?? []
+check(
+  '写入了 our-free-model / deepseek-v4.1-flash-free',
+  liveWritten[0]?.provider === 'our-free-model' && liveWritten[0]?.model === 'deepseek-v4.1-flash-free',
+  JSON.stringify(liveWritten),
+)
+
+// ================================================================ 场景 16
+console.log('\n--- 场景 16：没有 remote 服务时退回静态配置（不能崩） ---')
+mount(createScope({ entries: [] }), createScope(LLM_SECTION), undefined)
+await settle()
+await click(buttonByLabel('add'))
+const fallbackProviders = await optionLabels(0, 0)
+check(
+  '无 remote 时仍列出静态路由',
+  ['wbproxy-intl', 'dola2api', 'justwoker', 'openrouter'].every((r) => fallbackProviders.includes(r)),
+  fallbackProviders.join('|'),
+)
+check('无 remote 时不出现活路由', !fallbackProviders.includes('our-free-model'), fallbackProviders.join('|'))
+check('无 remote 时不显示告警（有静态路由就算可用）', find(tree, 'dshtmp-warn').length === 0)
 
 console.log(`\n${pass} 通过 / ${fail} 失败`)
 process.exit(fail === 0 ? 0 : 1)
