@@ -206,13 +206,15 @@ window.__ModuleLoader__.load({
         if (profile !== null && typeof profile === 'object') {
           if (Array.isArray(profile.models)) {
             for (const model of profile.models) {
-              if (model !== null && typeof model === 'object' && typeof model.id === 'string') models.push(model.id)
+              if (model !== null && typeof model === 'object' && typeof model.id === 'string') {
+                models.push({ id: model.id, name: typeof model.name === 'string' ? model.name : undefined })
+              }
             }
           } else if (profile.modelOverrides !== null && typeof profile.modelOverrides === 'object') {
-            for (const key of Object.keys(profile.modelOverrides)) models.push(key)
+            for (const key of Object.keys(profile.modelOverrides)) models.push({ id: key, name: undefined })
           }
         }
-        routes.push({ id, models: [...new Set(models)].sort() })
+        routes.push({ id, models, name: id })
       }
       routes.sort((a, b) => a.id.localeCompare(b.id))
       return routes
@@ -246,14 +248,20 @@ window.__ModuleLoader__.load({
         byId.set(id, created)
         return created
       }
-      const addModel = (route, model) => {
-        if (typeof model !== 'string' || model === '') return
-        if (!route.models.includes(model)) route.models.push(model)
+      const addModel = (route, id, name) => {
+        if (typeof id !== 'string' || id === '') return
+        const existing = route.models.find((model) => model.id === id)
+        if (existing !== undefined) {
+          // A later source may know the display name the earlier one lacked.
+          if (existing.name === undefined && typeof name === 'string' && name !== '') existing.name = name
+          return
+        }
+        route.models.push({ id, name: typeof name === 'string' && name !== '' ? name : undefined })
       }
 
       for (const route of staticRoutes) {
         const created = ensure(route.id)
-        for (const model of route.models) addModel(created, model)
+        for (const model of route.models) addModel(created, model.id, model.name)
       }
 
       const publishedRoutes = published === undefined || published === null ? undefined : published.routes
@@ -268,7 +276,7 @@ window.__ModuleLoader__.load({
           if (pair === null || typeof pair !== 'object') continue
           const route = byId.get(pair.route)
           if (route === undefined) continue
-          addModel(route, pair.model)
+          addModel(route, pair.model, pair.name)
         }
       }
 
@@ -288,12 +296,16 @@ window.__ModuleLoader__.load({
           const route = byId.get(group.id)
           if (route === undefined || !Array.isArray(group.models)) continue
           for (const model of group.models) {
-            if (model !== null && typeof model === 'object') addModel(route, model.id)
+            if (model !== null && typeof model === 'object') {
+              addModel(route, model.id, typeof model.name === 'string' ? model.name : undefined)
+            }
           }
         }
       }
 
-      for (const route of byId.values()) route.models.sort()
+      for (const route of byId.values()) {
+        route.models.sort((a, b) => a.id.localeCompare(b.id))
+      }
       return [...byId.values()].sort((a, b) => a.id.localeCompare(b.id))
     }
 
@@ -648,8 +660,18 @@ window.__ModuleLoader__.load({
           return options
         }
         const options = [{ value: '', label: t('choose') }]
-        for (const id of models) options.push({ value: id, label: id })
-        if (row.model !== '' && row.model !== CUSTOM && !models.includes(row.model)) {
+        for (const model of models) {
+          /**
+           * Label is the display name when one exists, the id otherwise.
+           * Channel-gated models are only distinguishable this way: the EAC
+           * rows of dsh-our-free-model carry the tag in their name, while their
+           * ids (`z-ai/glm-5.3`, `moonshotai/kimi-k3`) look like any other row —
+           * showing bare ids made a list that *did* contain them look like it
+           * contained only the free ones.
+           */
+          options.push({ value: model.id, label: model.name === undefined ? model.id : `${model.name} · ${model.id}` })
+        }
+        if (row.model !== '' && row.model !== CUSTOM && !models.some((model) => model.id === row.model)) {
           options.push({ value: row.model, label: `${row.model} (未在配置中)` })
         }
         options.push({ value: CUSTOM, label: t('customModel') })

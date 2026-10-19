@@ -77,6 +77,13 @@ export const settingsSchema = Schema.object({
     Schema.object({
       route: Schema.string().required(),
       model: Schema.string().required(),
+      /**
+       * Display name from the adapter, when it has one. Channel-gated models are
+       * only identifiable by this: dsh-our-free-model tags its EAC rows in the
+       * name while the ids look ordinary, so a picker built from ids alone made
+       * a complete list look like it held only the free models.
+       */
+      name: Schema.string(),
     }),
   ).default([]),
 })
@@ -210,7 +217,8 @@ export function apply(ctx) {
           for (const model of list) {
             if (kept >= MAX_PUBLISHED_MODELS_PER_ROUTE || models.length >= MAX_PUBLISHED_MODELS) break
             if (model !== null && typeof model === 'object' && typeof model.id === 'string' && model.id !== '') {
-              models.push({ route, model: model.id })
+              const name = typeof model.name === 'string' && model.name !== '' ? model.name : undefined
+              models.push(name === undefined ? { route, model: model.id } : { route, model: model.id, name })
               kept += 1
             }
           }

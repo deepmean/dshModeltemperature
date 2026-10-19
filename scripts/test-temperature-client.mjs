@@ -85,9 +85,15 @@ function createScope(initialValue, status = 'ready') {
     calls,
     getSnapshot: () => ({ value, status, writable: true }),
     subscribe: (fn) => { listeners.add(fn); return () => listeners.delete(fn) },
+    /**
+     * Path-level write, like the real `ConfigForm.set`: it is
+     * `mutate([{op:'set', path:[field], value}])`, so other fields of the
+     * section survive. Replacing the whole value here would erase `routes` and
+     * `models` on the first row edit and make the picker look empty.
+     */
     set: async (field, next) => {
       calls.push({ field, value: next })
-      value = { entries: Array.isArray(next) ? next : [] }
+      value = { ...value, [field]: Array.isArray(next) ? next : [] }
       for (const fn of listeners) fn()
       return true
     },
@@ -631,6 +637,43 @@ check(
   JSON.stringify(manualWritten),
 )
 check('温度留空时不下发 temperature', manualWritten[0]?.temperature === undefined, JSON.stringify(manualWritten[0]))
+
+// ================================================================ 场景 18
+console.log('\n--- 场景 18：发布的显示名要作为标签（否则 EAC 模型看不出来） ---')
+// 真实症状：our-free-model 的 EAC 行 id 是 `z-ai/glm-5.3` 这种普通样子，
+// 渠道标识只在显示名里。只显示 id 时，明明列表里有 8 个 EAC 模型，看起来却
+// 像"只有免费模型"。
+const NAMED_SECTION = {
+  entries: [],
+  routes: ['our-free-model'],
+  models: [
+    { route: 'our-free-model', model: 'z-ai/glm-5.3', name: 'EAC · GLM-5.3' },
+    { route: 'our-free-model', model: 'big-pickle', name: 'Big Pickle' },
+  ],
+}
+mount(createScope(NAMED_SECTION), createScope(LLM_SECTION), undefined)
+await settle()
+await click(buttonByLabel('add'))
+await pickOption(0, 0, 'our-free-model')
+const namedLabels = await optionLabels(0, 1)
+check(
+  '显示名出现在标签里',
+  namedLabels.some((label) => label.includes('EAC · GLM-5.3')),
+  namedLabels.join('|'),
+)
+check(
+  'id 也留在标签里（便于核对）',
+  namedLabels.some((label) => label.includes('z-ai/glm-5.3')),
+  namedLabels.join('|'),
+)
+
+await pickOption(0, 1, 'z-ai/glm-5.3')
+const namedWritten = scope.calls.at(-1)?.value ?? []
+check(
+  '存的是 id 而不是显示名',
+  namedWritten[0]?.model === 'z-ai/glm-5.3',
+  JSON.stringify(namedWritten),
+)
 
 console.log(`\n${pass} 通过 / ${fail} 失败`)
 process.exit(fail === 0 ? 0 : 1)
