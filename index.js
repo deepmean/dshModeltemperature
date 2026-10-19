@@ -30,6 +30,9 @@ export const inject = ['settings']
 /** Settings namespace owned by this plugin. Must match /^[a-z][a-z0-9-]*$/. */
 export const NAMESPACE = 'per-model-temperature'
 
+/** Upper bound per route for the published model list (see publishDirectory). */
+const MAX_PUBLISHED_MODELS_PER_ROUTE = 40
+
 /**
  * One model's declared temperature, keyed by provider route and model id.
  * @typedef {{ provider: string, model: string, temperature?: number }} PerModelEntry
@@ -49,6 +52,28 @@ export const settingsSchema = Schema.object({
       provider: Schema.string().required(),
       model: Schema.string().required(),
       temperature: Schema.number().min(0).max(2),
+    }),
+  ).default([]),
+  /**
+   * Live provider routes, published by the server half — read-only for the UI.
+   *
+   * The settings page used to build its dropdown from the `llm-pi-ai` config
+   * section alone, which lists only hand-declared routes. Plugins that call
+   * `ctx.llm.registerAdapter()` at runtime (dsh-our-free-model registers
+   * `our-free-model` and `our-free-model-region`, @opencode2dsh/dsh-plugin
+   * registers `opencode2dsh`) never appear there, so those routes were simply
+   * not selectable.
+   *
+   * The server half can read them, and it publishes them HERE because this
+   * document is the channel the page already loads successfully — no reliance
+   * on the remote API being reachable from the settings client.
+   */
+  routes: Schema.array(Schema.string()).default([]),
+  /** Model ids per route, published alongside {@link routes}. */
+  models: Schema.array(
+    Schema.object({
+      route: Schema.string().required(),
+      model: Schema.string().required(),
     }),
   ).default([]),
 })
@@ -119,4 +144,86 @@ export function apply(ctx) {
     const config = await next()
     return applyTemperature(scope.get().entries, config)
   })
+
+  /**
+   * Publish the live route/model directory into this plugin's own settings
+   * document.
+   *
+   * Both reads are guarded and optional: a deployment without `llm` or without
+   * the session controller simply publishes nothing, and the page keeps
+   * working from the static `llm-pi-ai` section. Writing only on change keeps
+   * the settings file from churning on every boot.
+   */
+  const service = (name) => {
+    if (typeof ctx.get !== 'function') return undefined
+    try {
+      // Non-strict: return undefined instead of throwing while the providing
+      // fiber is still activating.
+      return ctx.get(name, false)
+    } catch {
+      return undefined
+    }
+  }
+
+  const publishDirectory = () => {
+    const routes = []
+    const models = []
+    const llm = service('llm')
+    if (llm !== undefined && llm !== null && typeof llm.listProviders === 'function') {
+      try {
+        for (const provider of llm.listProviders()) {
+          if (provider !== null && typeof provider === 'object' && typeof provider.id === 'string' && provider.id !== '') {
+            routes.push(provider.id)
+          }
+        }
+      } catch { /* 目录不可用 */ }
+    }
+    const sessions = service('sessionController')
+    if (sessions !== undefined && sessions !== null && typeof sessions.modelCatalog === 'function') {
+      const known = new Set(routes)
+      try {
+        const catalog = sessions.modelCatalog()
+        if (catalog !== null && typeof catalog === 'object' && Array.isArray(catalog.groups)) {
+          for (const group of catalog.groups) {
+            if (group === null || typeof group !== 'object') continue
+            if (typeof group.id !== 'string' || !Array.isArray(group.models)) continue
+            // Only attach models to a route that actually exists: a catalog
+            // grouping with no registered route is not a selectable provider,
+            // and persisting it would put junk in the settings file.
+            if (!known.has(group.id)) continue
+            // Capped: this list is persisted into settings-legacy.yaml, and a
+            // gateway that serves hundreds of models would bloat that file for
+            // no benefit — nobody scrolls a 300-entry picker.
+            let kept = 0
+            for (const model of group.models) {
+              if (kept >= MAX_PUBLISHED_MODELS_PER_ROUTE) break
+              if (model !== null && typeof model === 'object' && typeof model.id === 'string' && model.id !== '') {
+                models.push({ route: group.id, model: model.id })
+                kept += 1
+              }
+            }
+          }
+        }
+      } catch { /* 目录不可用 */ }
+    }
+    if (routes.length === 0 && models.length === 0) return
+    routes.sort((a, b) => a.localeCompare(b))
+    models.sort((a, b) => a.route.localeCompare(b.route) || a.model.localeCompare(b.model))
+    const current = scope.get()
+    // Skip the write when nothing moved: this runs on boot and on every adapter
+    // change, and a needless write rewrites settings-legacy.yaml each time.
+    if (JSON.stringify(current.routes) === JSON.stringify(routes)
+      && JSON.stringify(current.models) === JSON.stringify(models)) return
+    try {
+      void scope.update({ routes, models })
+    } catch { /* 只读部署 */ }
+  }
+
+  // The adapters this needs are registered by other plugins, so retry across
+  // boot ordering and again whenever an adapter announces a change.
+  for (const delay of [0, 500, 1500, 4000]) {
+    const timer = setTimeout(publishDirectory, delay)
+    if (typeof timer === 'object' && timer !== null && typeof timer.unref === 'function') timer.unref()
+  }
+  ctx.on('llm/adapters-updated', publishDirectory)
 }

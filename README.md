@@ -217,8 +217,9 @@ dsh 自带 HMR（`dsh-base/cordis.patch.yml` 里的 `hmr` 行，web 部署下默
 ```bash
 node scripts/check-compat.mjs             # 23 passed, 0 failed  ← dsh 更新后先跑这个
 node scripts/relink.mjs                   # 更新后若变成实体副本，用它接回源目录
-node scripts/test-temperature-client.mjs  # 60 通过 / 0 失败
+node scripts/test-temperature-client.mjs  # 74 通过 / 0 失败
 node scripts/probe-apply-temperature.mjs  # 15 passed, 0 failed
+node scripts/probe-directory.mjs          # 11 passed, 0 failed
 node scripts/probe-live-record.mjs        # 15 passed, 0 failed
 ```
 
@@ -226,7 +227,18 @@ node scripts/probe-live-record.mjs        # 15 passed, 0 failed
 - **`test-temperature-client.mjs`** —— 用最小 React 桩把 `client.js` 真跑起来。覆盖「点添加没反应」、「三个字段都是下拉」、「换提供商必须清空模型」、「自定义标记不能串行」、「点菜单滚动条不能把菜单关掉」等曾经真踩过的坑。
 - **`probe-apply-temperature.mjs`** —— 把**已安装的那份** `index.js` 当真模块 import 进来，驱动真实的 `apply()` 监听器，验命中/不命中/多行并存/不改写入参。
 - **`probe-live-record.mjs`** —— 端到端：用 **harness 自己的 yaml 解析器**读真实的 `settings-legacy.yaml`，过**真实的 `settingsSchema`**，再进真实监听器，证明磁盘上那条记录真的会变成发出去的 `temperature`。
+- **`probe-directory.mjs`** —— 验服务端把**活路由表**（`llm.listProviders()`）和模型目录（`sessionController.modelCatalog()`）发布进设置文档，覆盖「运行时注册的路由也要能选」。含幂等与「宿主不提供这两个服务时不抛错」。
 - **`relink.mjs`** —— 把 `node_modules` 里那份插件接回源目录。dsh 更新会重跑安装、把链接换成副本，跑它恢复。「改完即生效」靠的就是这个链接。
+
+### 下拉里为什么会有插件自己的路由
+
+`dsh-our-free-model`、`@opencode2dsh/dsh-plugin` 这类插件用 `ctx.llm.registerAdapter()` 在**运行时**注册路由，它们**不在** `llm-pi-ai` 的静态 `providers` 段里。设置页的路由来源有三个，按可信度排：
+
+1. **`routes` / `models` 字段** —— 服务端在启动时（以及 `llm/adapters-updated` 时）把活目录写进本插件自己的设置文档。这是主通道：客户端本来就在读这份文档，不依赖 remote API。
+2. **remote 目录** —— `llm/listProviders` + `session/modelCatalog`，能拿到就用，拿不到就跳过。
+3. **静态 `llm-pi-ai` 段** —— 兜底，只含手写声明的路由。
+
+三个都没有的部署，下拉末尾还有「自定义提供商…」可以手敲 —— 但正常情况下用不到它。
 
 `npm test` 会把四个一起跑。三个探针优先读**已安装副本**（`$DSH_HOME/profiles/<profile>/node_modules/...`），读不到才回退到源码目录；可以用 `DSH_HOME` / `DSH_PROFILE_DIR` / `DSH_PACKAGE` 环境变量指到别的部署。
 

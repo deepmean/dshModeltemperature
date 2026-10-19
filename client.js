@@ -61,6 +61,10 @@ window.__ModuleLoader__.load({
       noModels: '— 该路由没有模型 —',
       custom: '自定义…',
       customPlaceholder: '输入 0–2',
+      customProvider: '自定义提供商…',
+      customModel: '自定义模型…',
+      phProvider: '输入路由名，如 our-free-model',
+      phModel: '输入模型 id，如 deepseek-v4.1-flash-free',
       phTemp: '留空 = 不下发',
       saved: '已保存',
       failed: '保存失败',
@@ -85,6 +89,10 @@ window.__ModuleLoader__.load({
       noModels: '— this route has no models —',
       custom: 'Custom…',
       customPlaceholder: 'enter 0–2',
+      customProvider: 'Custom provider…',
+      customModel: 'Custom model…',
+      phProvider: 'route name, e.g. our-free-model',
+      phModel: 'model id, e.g. deepseek-v4.1-flash-free',
       phTemp: 'empty = send none',
       saved: 'Saved',
       failed: 'Save failed',
@@ -156,7 +164,9 @@ window.__ModuleLoader__.load({
       for (const row of rows) {
         const provider = String(row.provider).trim()
         const model = String(row.model).trim()
-        if (provider === '' || model === '') continue
+        // The CUSTOM marker is a UI state, not a value: a row still waiting for
+        // the user to type states nothing, exactly like an empty one.
+        if (provider === '' || provider === CUSTOM || model === '' || model === CUSTOM) continue
         const entry = { provider, model }
         const raw = String(row.temperature).trim()
         if (raw !== '') {
@@ -209,33 +219,65 @@ window.__ModuleLoader__.load({
     }
 
     /**
-     * Union of the live registry and the static section, live winning.
+     * Union of every directory source, in decreasing authority:
      *
-     * Shapes it accepts (both are what the remote answers, and both are treated
-     * as optional so a half-answer still helps):
+     *   published : { routes: string[], models: [{ route, model }] }
+     *               — written by the server half into THIS plugin's settings
+     *               document, so it arrives over the channel the page already
+     *               loads. This is the one that works even when the remote API
+     *               is unreachable from the settings client.
+     *   live      : { providers: [{ id, name }], models: { groups: [...] } }
+     *               — the remote directory, best-effort.
+     *   static    : the llm-pi-ai config section, hand-declared routes only.
      *
-     *   providers : [{ id, name }]                      ← llm/listProviders
-     *   models    : { groups: [{ id, models: [{ id }] }] } ← session/modelCatalog
-     *
-     * `groups` is only used to fill in models for routes we already offer. A
-     * group id that matches nothing is ignored rather than invented into a
-     * route, because guessing a provider from a catalog grouping would put
-     * entries in the picker that cannot be selected downstream.
+     * A model is only attached to a route that some source already offers, so a
+     * stray catalog grouping can never invent a picker entry with nothing
+     * behind it.
      */
-    function mergeRoutes(staticRoutes, live) {
+    function mergeRoutes(staticRoutes, live, published) {
       const byId = new Map()
-      for (const route of staticRoutes) {
-        byId.set(route.id, { id: route.id, models: [...route.models], name: route.id })
+      const ensure = (id, name) => {
+        const existing = byId.get(id)
+        if (existing !== undefined) {
+          if (name !== undefined && name !== '') existing.name = name
+          return existing
+        }
+        const created = { id, models: [], name: name === undefined || name === '' ? id : name }
+        byId.set(id, created)
+        return created
       }
+      const addModel = (route, model) => {
+        if (typeof model !== 'string' || model === '') return
+        if (!route.models.includes(model)) route.models.push(model)
+      }
+
+      for (const route of staticRoutes) {
+        const created = ensure(route.id)
+        for (const model of route.models) addModel(created, model)
+      }
+
+      const publishedRoutes = published === undefined || published === null ? undefined : published.routes
+      if (Array.isArray(publishedRoutes)) {
+        for (const id of publishedRoutes) {
+          if (typeof id === 'string' && id !== '') ensure(id)
+        }
+      }
+      const publishedModels = published === undefined || published === null ? undefined : published.models
+      if (Array.isArray(publishedModels)) {
+        for (const pair of publishedModels) {
+          if (pair === null || typeof pair !== 'object') continue
+          const route = byId.get(pair.route)
+          if (route === undefined) continue
+          addModel(route, pair.model)
+        }
+      }
+
       const providers = live === undefined || live === null ? undefined : live.providers
       if (Array.isArray(providers)) {
         for (const provider of providers) {
           if (provider === null || typeof provider !== 'object') continue
           if (typeof provider.id !== 'string' || provider.id === '') continue
-          const name = typeof provider.name === 'string' && provider.name !== '' ? provider.name : provider.id
-          const existing = byId.get(provider.id)
-          if (existing === undefined) byId.set(provider.id, { id: provider.id, models: [], name })
-          else existing.name = name
+          ensure(provider.id, typeof provider.name === 'string' ? provider.name : undefined)
         }
       }
       const catalog = live === undefined || live === null ? undefined : live.models
@@ -246,13 +288,12 @@ window.__ModuleLoader__.load({
           const route = byId.get(group.id)
           if (route === undefined || !Array.isArray(group.models)) continue
           for (const model of group.models) {
-            if (model === null || typeof model !== 'object') continue
-            if (typeof model.id !== 'string' || model.id === '') continue
-            if (!route.models.includes(model.id)) route.models.push(model.id)
+            if (model !== null && typeof model === 'object') addModel(route, model.id)
           }
-          route.models.sort()
         }
       }
+
+      for (const route of byId.values()) route.models.sort()
       return [...byId.values()].sort((a, b) => a.id.localeCompare(b.id))
     }
 
@@ -395,7 +436,10 @@ window.__ModuleLoader__.load({
        * The page must never depend on this working.
        */
       react.useEffect(() => {
-        const remote = typeof props.getRemote === 'function' ? props.getRemote() : undefined
+        let remote
+        try {
+          remote = typeof props.getRemote === 'function' ? props.getRemote() : undefined
+        } catch { remote = undefined }
         if (remote === undefined || remote === null) return undefined
         let mounted = true
         const read = async () => {
@@ -428,7 +472,8 @@ window.__ModuleLoader__.load({
        * in — the same failure mode as the add button. While a draft exists,
        * local state is the truth.
        */
-      const hasDraft = rows.some((row) => row.provider === '' || row.model === '')
+      const hasDraft = rows.some((row) => row.provider === '' || row.model === ''
+        || row.provider === CUSTOM || row.model === CUSTOM)
       const revision = snapshot === undefined || snapshot === null ? undefined : snapshot.revision
       react.useEffect(() => {
         if (hasDraft) return
@@ -451,7 +496,17 @@ window.__ModuleLoader__.load({
        * answers from the live registry, so it includes them; the static section
        * stays as the fallback for a deployment without the remote service.
        */
-      const routes = mergeRoutes(routesOf(llmSnapshot), live)
+      /**
+       * The directory the server half published into this plugin's own settings
+       * document. Read from the same snapshot the rows come from, so it is
+       * available whenever the page renders — no extra round trip, no
+       * dependency on the remote service.
+       */
+      const published = snapshot !== undefined && snapshot !== null
+        && snapshot.value !== undefined && snapshot.value !== null
+        ? snapshot.value
+        : {}
+      const routes = mergeRoutes(routesOf(llmSnapshot), live, published)
       const routeIds = routes.map((route) => route.id)
       // Any route we can offer is enough; only warn when there is nothing at all.
       const routesAvailable = routes.length > 0
@@ -496,11 +551,39 @@ window.__ModuleLoader__.load({
 
       /** Provider changed: the previous model belongs to another route, so clear it. */
       function pickProvider(index, provider) {
+        if (provider === CUSTOM) {
+          // Hand-typed route: its models are unknowable, so the model cell
+          // switches to manual too rather than offering a wrong list. Spread the
+          // row: rebuilding it would drop `temperature` and silently flip that
+          // cell into its own input mode.
+          setRows(rows.map((row, i) => (i === index ? { ...row, provider: CUSTOM, model: CUSTOM } : row)))
+          setMessage(null)
+          return
+        }
         const next = rows.map((row, i) => (i === index ? { provider, model: '' } : row))
         void save(next)
       }
 
       function pickModel(index, model) {
+        if (model === CUSTOM) {
+          setRows(rows.map((row, i) => (i === index ? { ...row, model: CUSTOM } : row)))
+          setMessage(null)
+          return
+        }
+        void save(rows.map((row, i) => (i === index ? { ...row, model } : row)))
+      }
+
+      /** Commit a hand-typed route name. Value is passed in, not read back. */
+      function commitProvider(index, value) {
+        const provider = String(value).trim()
+        if (provider === '') return
+        void save(rows.map((row, i) => (i === index ? { ...row, provider } : row)))
+      }
+
+      /** Commit a hand-typed model id. */
+      function commitModel(index, value) {
+        const model = String(value).trim()
+        if (model === '') return
         void save(rows.map((row, i) => (i === index ? { ...row, model } : row)))
       }
 
@@ -539,24 +622,37 @@ window.__ModuleLoader__.load({
       function providerOptions(row) {
         const options = [{ value: '', label: t('choose') }]
         for (const id of routeIds) options.push({ value: id, label: id })
-        // A stored route the live config no longer declares stays visible.
-        if (row.provider !== '' && !routeIds.includes(row.provider)) {
+        // A stored route the live/static directory no longer declares stays visible.
+        if (row.provider !== '' && row.provider !== CUSTOM && !routeIds.includes(row.provider)) {
           options.push({ value: row.provider, label: `${row.provider} (未在配置中)` })
         }
+        /**
+         * The manual escape hatch, and the reason it exists: routes registered
+         * at runtime by another plugin may not reach this client at all (the
+         * live directory is a best-effort read). Without this option the user
+         * simply cannot configure such a route — there is nothing to click.
+         */
+        options.push({ value: CUSTOM, label: t('customProvider') })
         return options
       }
 
       function modelOptions(row) {
-        if (row.provider === '') return [{ value: '', label: t('chooseModel') }]
+        // An unknown or hand-typed route has no enumerable models: the only
+        // honest offer is the manual one.
+        if (row.provider === '' || row.provider === CUSTOM) return [{ value: '', label: t('chooseModel') }]
         const models = modelsFor(row.provider)
         if (models.length === 0) {
           const options = [{ value: '', label: t('noModels') }]
-          if (row.model !== '') options.push({ value: row.model, label: row.model })
+          if (row.model !== '' && row.model !== CUSTOM) options.push({ value: row.model, label: row.model })
+          options.push({ value: CUSTOM, label: t('customModel') })
           return options
         }
         const options = [{ value: '', label: t('choose') }]
         for (const id of models) options.push({ value: id, label: id })
-        if (row.model !== '' && !models.includes(row.model)) options.push({ value: row.model, label: `${row.model} (未在配置中)` })
+        if (row.model !== '' && row.model !== CUSTOM && !models.includes(row.model)) {
+          options.push({ value: row.model, label: `${row.model} (未在配置中)` })
+        }
+        options.push({ value: CUSTOM, label: t('customModel') })
         return options
       }
 
@@ -596,27 +692,51 @@ window.__ModuleLoader__.load({
                   onClose: closeMenu,
                   onChange: (value) => pickTemperature(index, value),
                 })
+            /**
+             * Hand-typed cells. `CUSTOM` marks "waiting for the user to type",
+             * so the input starts empty and commits on blur — the same contract
+             * as the temperature cell, and the reason `toEntries` skips the
+             * marker instead of storing it.
+             */
+            const providerCell = row.provider === CUSTOM
+              ? h('input', {
+                  className: 'dshtmp-input',
+                  value: '',
+                  placeholder: t('phProvider'),
+                  disabled: busy || !writable,
+                  onBlur: (event) => commitProvider(index, event.target.value),
+                })
+              : h(Select, {
+                  value: row.provider,
+                  disabled: busy || !writable,
+                  options: providerOptions(row),
+                  open: openKey === keyOf('p', index),
+                  onToggle: () => toggleMenu(keyOf('p', index)),
+                  onClose: closeMenu,
+                  onChange: (value) => pickProvider(index, value),
+                })
+            const modelCell = row.model === CUSTOM
+              ? h('input', {
+                  className: 'dshtmp-input',
+                  value: '',
+                  placeholder: t('phModel'),
+                  disabled: busy || !writable,
+                  onBlur: (event) => commitModel(index, event.target.value),
+                })
+              : h(Select, {
+                  value: row.model,
+                  disabled: busy || !writable || row.provider === '',
+                  options: modelOptions(row),
+                  open: openKey === keyOf('m', index),
+                  onToggle: () => toggleMenu(keyOf('m', index)),
+                  onClose: closeMenu,
+                  onChange: (value) => pickModel(index, value),
+                })
             return h(
               'div',
               { className: 'dshtmp-row', key: String(index) },
-              h(Select, {
-                value: row.provider,
-                disabled: busy || !writable,
-                options: providerOptions(row),
-                open: openKey === keyOf('p', index),
-                onToggle: () => toggleMenu(keyOf('p', index)),
-                onClose: closeMenu,
-                onChange: (value) => pickProvider(index, value),
-              }),
-              h(Select, {
-                value: row.model,
-                disabled: busy || !writable || row.provider === '',
-                options: modelOptions(row),
-                open: openKey === keyOf('m', index),
-                onToggle: () => toggleMenu(keyOf('m', index)),
-                onClose: closeMenu,
-                onChange: (value) => pickModel(index, value),
-              }),
+              providerCell,
+              modelCell,
               temperatureCell,
               h('button', {
                 className: 'dshtmp-btn dshtmp-del',
@@ -673,12 +793,28 @@ window.__ModuleLoader__.load({
       const scope = ctx.configForms.get(NS)
       const llmScope = ctx.configForms.get(LLM_NS)
       /**
-       * The live route registry, resolved lazily through `ctx.get` rather than
-       * declared in `inject`: `remote` may mount after this plugin, and a hard
-       * dependency on it would take the whole page down on a deployment without
-       * api-remotes. The page falls back to the static section instead.
+       * The live route registry, best-effort.
+       *
+       * `remote` is provided by the api-gateway client half, not by this
+       * plugin's own dependencies, and cordis throws on a property access for a
+       * service that is not in `inject` — so both paths are guarded and a
+       * failure simply means "no live directory", never a broken page.
        */
-      const getRemote = () => (typeof ctx.get === 'function' ? ctx.get('remote') : undefined)
+      const getRemote = () => {
+        try {
+          if (typeof ctx.get === 'function') {
+            // `false` = non-strict: return undefined instead of throwing when
+            // the service is absent or its providing fiber is not active yet.
+            const viaGet = ctx.get('remote', false)
+            if (viaGet !== undefined && viaGet !== null) return viaGet
+          }
+        } catch { /* fall through */ }
+        try {
+          return ctx.remote
+        } catch {
+          return undefined
+        }
+      }
       ctx.effect(() => ctx.locale.register(NS, { zh, en }), 'per-model-temperature: copy dictionaries')
       ctx.effect(
         () => ctx.slots.inject('settings.section', () => ctx.slots.register({

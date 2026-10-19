@@ -594,5 +594,43 @@ check(
 check('无 remote 时不出现活路由', !fallbackProviders.includes('our-free-model'), fallbackProviders.join('|'))
 check('无 remote 时不显示告警（有静态路由就算可用）', find(tree, 'dshtmp-warn').length === 0)
 
+// ================================================================ 场景 17
+console.log('\n--- 场景 17：手敲路由名（活目录读不到时的兜底） ---')
+// 这是最后一道保险：即使 remote 服务完全拿不到、静态配置里也没有这个路由，
+// 用户仍然能把 our-free-model 这类运行时路由配进来 —— 否则界面上无路可走。
+mount(createScope({ entries: [] }), createScope(LLM_SECTION), undefined)
+await settle()
+await click(buttonByLabel('add'))
+
+await pickOption(0, 0, CUSTOM_SENTINEL)
+check(
+  '选「自定义提供商…」后提供商+模型都变成输入框',
+  inputsOfRow(0).length === 2,
+  `实际 ${inputsOfRow(0).length} 个输入框`,
+)
+
+scope.calls.length = 0
+inputsOfRow(0)[0].props.onBlur({ target: { value: 'our-free-model' } })
+await settle()
+const halfWritten = scope.calls.at(-1)?.value ?? []
+check(
+  '只填了提供商、模型还空着 → 该行不被写入',
+  halfWritten.every((entry) => entry.provider !== 'our-free-model'),
+  JSON.stringify(halfWritten),
+)
+check('模型格仍是输入框（等用户填）', inputsOfRow(0).length === 1, `实际 ${inputsOfRow(0).length}`)
+
+inputsOfRow(0)[0].props.onBlur({ target: { value: 'deepseek-v4.1-flash-free' } })
+await settle()
+const manualWritten = scope.calls.at(-1)?.value ?? []
+check(
+  '手敲的路由被写入',
+  manualWritten.length === 1
+    && manualWritten[0].provider === 'our-free-model'
+    && manualWritten[0].model === 'deepseek-v4.1-flash-free',
+  JSON.stringify(manualWritten),
+)
+check('温度留空时不下发 temperature', manualWritten[0]?.temperature === undefined, JSON.stringify(manualWritten[0]))
+
 console.log(`\n${pass} 通过 / ${fail} 失败`)
 process.exit(fail === 0 ? 0 : 1)
