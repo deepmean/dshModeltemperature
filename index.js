@@ -33,6 +33,9 @@ export const NAMESPACE = 'per-model-temperature'
 /** Upper bound per route for the published model list (see publishDirectory). */
 const MAX_PUBLISHED_MODELS_PER_ROUTE = 40
 
+/** Upper bound across all routes: this list is persisted into the settings file. */
+const MAX_PUBLISHED_MODELS = 400
+
 /**
  * One model's declared temperature, keyed by provider route and model id.
  * @typedef {{ provider: string, model: string, temperature?: number }} PerModelEntry
@@ -165,65 +168,74 @@ export function apply(ctx) {
     }
   }
 
-  const publishDirectory = () => {
-    const routes = []
-    const models = []
-    const llm = service('llm')
-    if (llm !== undefined && llm !== null && typeof llm.listProviders === 'function') {
-      try {
-        for (const provider of llm.listProviders()) {
-          if (provider !== null && typeof provider === 'object' && typeof provider.id === 'string' && provider.id !== '') {
-            routes.push(provider.id)
+  /**
+   * `llm.listModels()` is async — the adapter resolves it. Reading it
+   * synchronously is exactly why `models` came back empty once: the catalog
+   * helper returns a Promise, and `.groups` on a Promise is always undefined.
+   *
+   * Routes come from the synchronous registry; models are fetched per route and
+   * a single failing route never aborts the rest.
+   */
+  let publishing = false
+  const publishDirectory = async () => {
+    if (publishing) return
+    publishing = true
+    try {
+      const routes = []
+      const models = []
+      const llm = service('llm')
+      if (llm !== undefined && llm !== null && typeof llm.listProviders === 'function') {
+        try {
+          for (const provider of llm.listProviders()) {
+            if (provider !== null && typeof provider === 'object' && typeof provider.id === 'string' && provider.id !== '') {
+              routes.push(provider.id)
+            }
           }
-        }
-      } catch { /* 目录不可用 */ }
-    }
-    const sessions = service('sessionController')
-    if (sessions !== undefined && sessions !== null && typeof sessions.modelCatalog === 'function') {
-      const known = new Set(routes)
-      try {
-        const catalog = sessions.modelCatalog()
-        if (catalog !== null && typeof catalog === 'object' && Array.isArray(catalog.groups)) {
-          for (const group of catalog.groups) {
-            if (group === null || typeof group !== 'object') continue
-            if (typeof group.id !== 'string' || !Array.isArray(group.models)) continue
-            // Only attach models to a route that actually exists: a catalog
-            // grouping with no registered route is not a selectable provider,
-            // and persisting it would put junk in the settings file.
-            if (!known.has(group.id)) continue
-            // Capped: this list is persisted into settings-legacy.yaml, and a
-            // gateway that serves hundreds of models would bloat that file for
-            // no benefit — nobody scrolls a 300-entry picker.
-            let kept = 0
-            for (const model of group.models) {
-              if (kept >= MAX_PUBLISHED_MODELS_PER_ROUTE) break
-              if (model !== null && typeof model === 'object' && typeof model.id === 'string' && model.id !== '') {
-                models.push({ route: group.id, model: model.id })
-                kept += 1
-              }
+        } catch { /* 目录不可用 */ }
+      }
+      routes.sort((a, b) => a.localeCompare(b))
+      if (routes.length === 0) return
+
+      if (typeof llm.listModels === 'function') {
+        for (const route of routes) {
+          if (models.length >= MAX_PUBLISHED_MODELS) break
+          let list
+          try {
+            list = await llm.listModels(route)
+          } catch {
+            continue // 一个路由取不到，不影响其它
+          }
+          if (!Array.isArray(list)) continue
+          let kept = 0
+          for (const model of list) {
+            if (kept >= MAX_PUBLISHED_MODELS_PER_ROUTE || models.length >= MAX_PUBLISHED_MODELS) break
+            if (model !== null && typeof model === 'object' && typeof model.id === 'string' && model.id !== '') {
+              models.push({ route, model: model.id })
+              kept += 1
             }
           }
         }
-      } catch { /* 目录不可用 */ }
+      }
+      models.sort((a, b) => a.route.localeCompare(b.route) || a.model.localeCompare(b.model))
+
+      const current = scope.get()
+      // Skip the write when nothing moved: this runs on boot and on every
+      // adapter change, and a needless write rewrites settings-legacy.yaml.
+      if (JSON.stringify(current.routes) === JSON.stringify(routes)
+        && JSON.stringify(current.models) === JSON.stringify(models)) return
+      try {
+        await scope.update({ routes, models })
+      } catch { /* 只读部署 */ }
+    } finally {
+      publishing = false
     }
-    if (routes.length === 0 && models.length === 0) return
-    routes.sort((a, b) => a.localeCompare(b))
-    models.sort((a, b) => a.route.localeCompare(b.route) || a.model.localeCompare(b.model))
-    const current = scope.get()
-    // Skip the write when nothing moved: this runs on boot and on every adapter
-    // change, and a needless write rewrites settings-legacy.yaml each time.
-    if (JSON.stringify(current.routes) === JSON.stringify(routes)
-      && JSON.stringify(current.models) === JSON.stringify(models)) return
-    try {
-      void scope.update({ routes, models })
-    } catch { /* 只读部署 */ }
   }
 
   // The adapters this needs are registered by other plugins, so retry across
   // boot ordering and again whenever an adapter announces a change.
-  for (const delay of [0, 500, 1500, 4000]) {
-    const timer = setTimeout(publishDirectory, delay)
+  for (const delay of [0, 1000, 3000]) {
+    const timer = setTimeout(() => { void publishDirectory() }, delay)
     if (typeof timer === 'object' && timer !== null && typeof timer.unref === 'function') timer.unref()
   }
-  ctx.on('llm/adapters-updated', publishDirectory)
+  ctx.on('llm/adapters-updated', () => { void publishDirectory() })
 }

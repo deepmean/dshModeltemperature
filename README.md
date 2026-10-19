@@ -1,4 +1,4 @@
-# dsh-per-model-temperature
+﻿# dsh-per-model-temperature
 
 给 [DeepSeek Harness](https://github.com/deepseek-ai/dsh) 用的**按模型温度**插件：在设置页里给每一条 `llm-pi-ai` 路由的每个模型单独配一个 `temperature`，并在请求真正发出去之前把它塞进去。
 
@@ -212,14 +212,14 @@ dsh 自带 HMR（`dsh-base/cordis.patch.yml` 里的 `hmr` 行，web 部署下默
 
 ## 测试
 
-四个脚本，都不需要浏览器：
+六个脚本，都不需要浏览器：
 
 ```bash
 node scripts/check-compat.mjs             # 23 passed, 0 failed  ← dsh 更新后先跑这个
 node scripts/relink.mjs                   # 更新后若变成实体副本，用它接回源目录
 node scripts/test-temperature-client.mjs  # 74 通过 / 0 失败
 node scripts/probe-apply-temperature.mjs  # 15 passed, 0 failed
-node scripts/probe-directory.mjs          # 11 passed, 0 failed
+node scripts/probe-directory.mjs          # 13 passed, 0 failed
 node scripts/probe-live-record.mjs        # 15 passed, 0 failed
 ```
 
@@ -227,7 +227,7 @@ node scripts/probe-live-record.mjs        # 15 passed, 0 failed
 - **`test-temperature-client.mjs`** —— 用最小 React 桩把 `client.js` 真跑起来。覆盖「点添加没反应」、「三个字段都是下拉」、「换提供商必须清空模型」、「自定义标记不能串行」、「点菜单滚动条不能把菜单关掉」等曾经真踩过的坑。
 - **`probe-apply-temperature.mjs`** —— 把**已安装的那份** `index.js` 当真模块 import 进来，驱动真实的 `apply()` 监听器，验命中/不命中/多行并存/不改写入参。
 - **`probe-live-record.mjs`** —— 端到端：用 **harness 自己的 yaml 解析器**读真实的 `settings-legacy.yaml`，过**真实的 `settingsSchema`**，再进真实监听器，证明磁盘上那条记录真的会变成发出去的 `temperature`。
-- **`probe-directory.mjs`** —— 验服务端把**活路由表**（`llm.listProviders()`）和模型目录（`sessionController.modelCatalog()`）发布进设置文档，覆盖「运行时注册的路由也要能选」。含幂等与「宿主不提供这两个服务时不抛错」。
+- **`probe-directory.mjs`** —— 验服务端把**活路由表**（`llm.listProviders()`，同步）和**每个路由的模型**（`llm.listModels(route)`，**异步**）发布进设置文档，覆盖「运行时注册的路由也要能选」。含幂等、「某个路由取模型抛错不影响其它」、「宿主不提供 llm 时不抛错」。
 - **`relink.mjs`** —— 把 `node_modules` 里那份插件接回源目录。dsh 更新会重跑安装、把链接换成副本，跑它恢复。「改完即生效」靠的就是这个链接。
 
 ### 下拉里为什么会有插件自己的路由
