@@ -43,6 +43,22 @@ window.__ModuleLoader__.load({
      */
     const CUSTOM = '__custom__'
 
+    //#region menu geometry
+    /**
+     * Past this many options a bare list stops being scannable, so the menu
+     * grows a filter input. Thirteen: the temperature dropdown carries twelve
+     * options (empty + ten presets + custom) and stays clean without a filter,
+     * while a real model directory (30+) starts needing one.
+     */
+    const SEARCH_THRESHOLD = 13
+    /** Menu bounds, in px: never shorter than this even when squeezed, never
+     *  taller than this even with room to spare — taller menus stop feeling
+     *  like menus. */
+    const MENU_MIN_HEIGHT = 96
+    const MENU_MAX_HEIGHT = 320
+    const MENU_MIN_WIDTH = 180
+    //#endregion
+
     //#region copy
     const zh = {
       nav: '模型温度',
@@ -66,6 +82,8 @@ window.__ModuleLoader__.load({
       phProvider: '输入路由名，如 our-free-model',
       phModel: '输入模型 id，如 deepseek-v4.1-flash-free',
       phTemp: '留空 = 不下发',
+      searchPlaceholder: '输入过滤，回车选第一项…',
+      noMatch: '没有匹配项',
       saved: '已保存',
       failed: '保存失败',
       empty: '还没有配置。点「添加一行」开始。',
@@ -94,6 +112,8 @@ window.__ModuleLoader__.load({
       phProvider: 'route name, e.g. our-free-model',
       phModel: 'model id, e.g. deepseek-v4.1-flash-free',
       phTemp: 'empty = send none',
+      searchPlaceholder: 'type to filter, Enter picks the first…',
+      noMatch: 'no match',
       saved: 'Saved',
       failed: 'Save failed',
       empty: 'Nothing configured yet. Use "Add row" to start.',
@@ -119,8 +139,18 @@ window.__ModuleLoader__.load({
       '.dshtmp-label{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}',
       '.dshtmp-caret{color:var(--dsw-alias-label-tertiary);font-size:10px;line-height:1;flex:none}',
       '.dshtmp-backdrop{position:fixed;inset:0;z-index:40}',
-      '.dshtmp-menu{position:absolute;z-index:41;top:calc(100% + 4px);left:0;right:0;max-height:210px;overflow-y:auto;overscroll-behavior:contain;border:1px solid var(--dsw-alias-border-l2);background:var(--dsw-alias-bg-layer-3);border-radius:8px;padding:4px;box-shadow:0 10px 28px rgba(0,0,0,.2)}',
-      '.dshtmp-option{display:block;width:100%;border:0;background:transparent;color:var(--dsw-alias-label-primary);font:inherit;font-variant-numeric:tabular-nums;text-align:left;border-radius:6px;padding:5px 8px;cursor:pointer;white-space:nowrap}',
+      /**
+       * The menu is positioned by the PARENT (fixed, at viewport coordinates the
+       * trigger measured when it opened), not by CSS here. The card is a scroll
+       * container and an absolutely-positioned child is clipped by it — a row
+       * near the bottom of a long table had its menu cut off entirely.
+       * `position:fixed` escapes that clipping ancestor.
+       */
+      '.dshtmp-menu{position:fixed;z-index:41;overflow-y:auto;overscroll-behavior:contain;border:1px solid var(--dsw-alias-border-l2);background:var(--dsw-alias-bg-layer-3);border-radius:8px;padding:4px;box-shadow:0 10px 28px rgba(0,0,0,.2);min-width:180px}',
+      '.dshtmp-search{width:100%;box-sizing:border-box;border:0;border-bottom:1px solid var(--dsw-alias-border-l2);background:transparent;color:var(--dsw-alias-label-primary);font:inherit;padding:6px 8px;margin:0 0 4px;outline:none;position:sticky;top:0;z-index:1}',
+      '.dshtmp-search::placeholder{color:var(--dsw-alias-label-tertiary)}',
+      '.dshtmp-nomatch{color:var(--dsw-alias-label-tertiary);padding:6px 8px;font-size:12px}',
+      '.dshtmp-option{display:block;width:100%;border:0;background:transparent;color:var(--dsw-alias-label-primary);font:inherit;font-variant-numeric:tabular-nums;text-align:left;border-radius:6px;padding:5px 8px;cursor:pointer;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}',
       '.dshtmp-option:hover{background:var(--dsw-alias-bg-layer-2)}',
       '.dshtmp-option-on{color:var(--dsw-alias-brand-primary);font-weight:600}',
       '.dshtmp-input:focus,.dshtmp-select:focus{border-color:var(--dsw-alias-brand-primary);outline:none}',
@@ -330,21 +360,73 @@ window.__ModuleLoader__.load({
      * one menu at a time, and it survives the re-render that every save causes.
      */
     function Select(props) {
-      const options = Array.isArray(props.options) ? props.options : []
-      const chosen = options.find((option) => option.value === props.value)
-      const label = chosen !== undefined
-        ? chosen.label
-        : (props.value === '' || props.value === undefined ? '' : String(props.value))
+      const allOptions = Array.isArray(props.options) ? props.options : []
+      /**
+       * Filter text for long lists and the trigger's viewport rect captured
+       * when the menu opened. Both are per-menu interaction state: the query
+       * resets when the menu closes, and the anchor is kept (not recomputed
+       * per render) so a page scroll while open cannot drag the menu around —
+       * the backdrop closes it instead.
+       */
+      const [query, setQuery] = react.useState('')
+      const [anchor, setAnchor] = react.useState(null)
       const open = props.open === true && props.disabled !== true
+      // Reset per-menu state when the menu closes: leftover filter text or a
+      // stale anchor must not leak into the next open. Effect-less by design —
+      // this is a render-time check against the previous value.
+      const [wasOpen, setWasOpen] = react.useState(open)
+      if (open !== wasOpen) {
+        setWasOpen(open)
+        if (!open) { setQuery(''); setAnchor(null) }
+      }
       const stop = (event) => {
         if (event !== undefined && event !== null && typeof event.stopPropagation === 'function') event.stopPropagation()
       }
+
+      /**
+       * Filter past a count a human can scan: match the label or the value, so
+       * "kimi" finds `moonshotai/kimi-k3` even though the visible label is the
+       * display name.
+       */
+      const showSearch = allOptions.length > SEARCH_THRESHOLD
+      const trimmed = query.trim().toLowerCase()
+      const options = trimmed === ''
+        ? allOptions
+        : allOptions.filter((option) => `${option.label} ${option.value}`.toLowerCase().includes(trimmed))
+      const chosen = allOptions.find((option) => option.value === props.value)
+      const label = chosen !== undefined
+        ? chosen.label
+        : (props.value === '' || props.value === undefined ? '' : String(props.value))
 
       const children = [
         h('span', { className: 'dshtmp-label', key: '__label' }, label),
         h('span', { className: 'dshtmp-caret', key: '__caret' }, '▾'),
       ]
       if (open) {
+        /**
+         * Menu geometry from the anchor rect. Fixed positioning is what gets
+         * the menu out of the card's scroll container — an absolutely
+         * positioned child was clipped by it, so a row near the bottom of a
+         * long table had its menu cut off entirely. Flip up when there is more
+         * room above, cap the height to the space that actually fits, clamp
+         * the left edge so a wide menu near the viewport edge stays visible.
+         */
+        let style
+        if (anchor !== null && typeof anchor === 'object') {
+          const below = anchor.viewportBelow
+          const above = anchor.viewportAbove
+          const flip = above > below
+          const room = Math.max(flip ? above : below, MENU_MIN_HEIGHT) - 12
+          style = {
+            left: `${anchor.clampedLeft}px`,
+            ...(flip ? { bottom: `${anchor.viewportHeight - anchor.top + 4}px` } : { top: `${anchor.bottom + 4}px` }),
+            width: `${Math.max(anchor.width, MENU_MIN_WIDTH)}px`,
+            maxHeight: `${Math.min(room, MENU_MAX_HEIGHT)}px`,
+          }
+        } else {
+          style = { maxHeight: `${MENU_MAX_HEIGHT}px` }
+        }
+
         children.push(h('div', {
           className: 'dshtmp-backdrop',
           key: '__backdrop',
@@ -357,28 +439,54 @@ window.__ModuleLoader__.load({
             className: 'dshtmp-menu',
             key: '__menu',
             role: 'listbox',
+            style,
             onMouseDown: stop,
             onClick: stop,
           },
-          options.map((option) => h(
-            'button',
-            {
-              className: `dshtmp-option${option.value === props.value ? ' dshtmp-option-on' : ''}`,
-              key: option.value,
-              type: 'button',
-              role: 'option',
-              'data-value': option.value,
-              'aria-selected': option.value === props.value,
-              onClick: (event) => {
-                stop(event)
-                props.onClose()
-                // Same contract as a native select: re-picking the current
-                // value is not a change and must not write.
-                if (option.value !== props.value) props.onChange(option.value)
+          showSearch
+            ? h('input', {
+                className: 'dshtmp-search',
+                key: '__search',
+                type: 'text',
+                value: query,
+                placeholder: props.searchPlaceholder ?? '…',
+                autoFocus: true,
+                // Enter picks the first match; Escape closes. stopPropagation
+                // keeps these keys away from the trigger's own handler.
+                onKeyDown: (event) => {
+                  stop(event)
+                  if (event.key === 'Escape') { event.preventDefault(); props.onClose(); return }
+                  if (event.key === 'Enter' && options.length > 0) {
+                    event.preventDefault()
+                    const first = options[0]
+                    props.onClose()
+                    if (first.value !== props.value) props.onChange(first.value)
+                  }
+                },
+                onChange: (event) => setQuery(event.target.value),
+              })
+            : null,
+          options.length === 0
+            ? h('div', { className: 'dshtmp-nomatch', key: '__none' }, props.noMatch ?? '—')
+            : options.map((option) => h(
+              'button',
+              {
+                className: `dshtmp-option${option.value === props.value ? ' dshtmp-option-on' : ''}`,
+                key: option.value,
+                type: 'button',
+                role: 'option',
+                'data-value': option.value,
+                'aria-selected': option.value === props.value,
+                onClick: (event) => {
+                  stop(event)
+                  props.onClose()
+                  // Same contract as a native select: re-picking the current
+                  // value is not a change and must not write.
+                  if (option.value !== props.value) props.onChange(option.value)
+                },
               },
-            },
-            option.label,
-          )),
+              option.label,
+            )),
         ))
       }
 
@@ -392,7 +500,32 @@ window.__ModuleLoader__.load({
           'aria-haspopup': 'listbox',
           'data-value': props.value,
           'data-disabled': props.disabled === true,
+          'data-open': open,
           title: label,
+          /**
+           * Measure the trigger once, when the menu opens and no anchor is held
+           * yet. The rect is frozen in state afterwards: recomputing on every
+           * render would drag the menu with the page scroll while it is open,
+           * and the backdrop is the correct way to dismiss in that situation.
+           * Browsers only attach DOM element refs, so the guard keeps the test
+           * stub's plain-object nodes honest.
+           */
+          ref: open && anchor === null ? (node) => {
+            if (node === null || node === undefined || typeof node.getBoundingClientRect !== 'function') return
+            const rect = node.getBoundingClientRect()
+            setAnchor({
+              top: rect.top,
+              bottom: rect.bottom,
+              left: rect.left,
+              width: rect.width,
+              // Derived once, so the menu never re-flips mid-open when the
+              // viewport shrinks (a keyboard opening, a window resize).
+              viewportHeight: window.innerHeight,
+              viewportAbove: rect.top,
+              viewportBelow: window.innerHeight - rect.bottom,
+              clampedLeft: Math.max(8, Math.min(rect.left, window.innerWidth - 8 - Math.max(rect.width, MENU_MIN_WIDTH))),
+            })
+          } : undefined,
           onClick: () => { if (props.disabled !== true) props.onToggle() },
           onKeyDown: (event) => {
             if (props.disabled === true) return

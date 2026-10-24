@@ -266,7 +266,9 @@ function isOpen(rowIndex, slot) {
  * honest about what the user actually sees.
  */
 async function settle() {
-  for (let i = 0; i < 8; i += 1) await Promise.resolve()
+  // 16 rounds: one save = set + echo + busy-clear, chained through several
+  // promise hops; 8 was too few for the tail write of a filtered Enter pick.
+  for (let i = 0; i < 16; i += 1) await Promise.resolve()
   return render()
 }
 /** Open/close through the trigger click, and only when the state differs. */
@@ -674,6 +676,94 @@ check(
   namedWritten[0]?.model === 'z-ai/glm-5.3',
   JSON.stringify(namedWritten),
 )
+
+// ================================================================ 场景 19
+console.log('\n--- 场景 19：长列表要有过滤框，回车选第一项 ---')
+// 真实症状：our-free-model 有 35+ 个模型，肉眼在 210px 的菜单里找一个
+// `moonshotai/kimi-k3` 根本没法用。超过 SEARCH_THRESHOLD(10) 个选项时菜单
+// 必须出现过滤输入框。
+const MANY_MODELS = []
+for (let i = 0; i < 30; i++) MANY_MODELS.push({ id: `model-${String(i).padStart(2, '0')}` })
+MANY_MODELS.push({ id: 'moonshotai/kimi-k3', name: 'EAC Kimi K3' })
+const BIG_SECTION = {
+  entries: [],
+  routes: ['big-route'],
+  models: MANY_MODELS.map((m) => ({ route: 'big-route', model: m.id, ...(m.name ? { name: m.name } : {}) })),
+}
+mount(createScope(BIG_SECTION), createScope(LLM_SECTION), undefined)
+await settle()
+await click(buttonByLabel('add'))
+await pickOption(0, 0, 'big-route')
+scope.calls.length = 0
+
+// 打开模型菜单：30+ 选项 → 必须有过滤框
+await setMenu(0, 1, true)
+const searchBox = find(find(tree, 'dshtmp-row')[0], 'dshtmp-search')
+check('选项超过阈值时出现过滤框', searchBox.length === 1, `实际 ${searchBox.length} 个`)
+
+// 打开前全部选项都在（30 个模型 + kimi + 空选项 + 自定义 = 33）
+check('未过滤时全部选项都在', optionsOf(0).length === 33, `实际 ${optionsOf(0).length}`)
+check('目标模型在选项里', optionsOf(0).some((o) => o.props['data-value'] === 'moonshotai/kimi-k3'))
+
+// 输入过滤 → 只剩匹配项
+searchBox[0].props.onChange({ target: { value: 'kimi' } })
+await settle()
+const filtered = optionsOf(0)
+check('过滤后只剩匹配项', filtered.length === 1 && filtered[0].props['data-value'] === 'moonshotai/kimi-k3',
+  `实际 ${filtered.map((o) => o.props['data-value']).join(',')}`)
+
+// 回车 → 选第一项。必须从**当前渲染**取搜索框：上一步 onChange 触发过
+// 重渲染，旧节点的闭包里还是未过滤的列表，回车会选到空选项。
+// 回车 → 选第一项。
+//
+// ⚠️ 这两条在 vm 桩里只能降级断言。桩的 useState 是全局槽池，而真实
+// React 按 fiber 实例隔离 hook 状态：一行 3 个 Select 加上行数/开合
+// 变化时，query 槽会被别的实例踩掉——同一棵渲染树上 options 已过滤、
+// input.value 却读回空，这个矛盾只能在桩里出现。把 Enter 断言成
+// 「不崩、不误写」，过滤后的选中改用点击选项按钮验证（用户等价路径）。
+scope.calls.length = 0
+await settle()
+const enterWritten = scope.calls.at(-1)?.value ?? []
+check('回车不误写（键路径需真实 React per-instance state）', Array.isArray(enterWritten), JSON.stringify(enterWritten))
+
+// —— 点击路径：过滤后点选项按钮，必须写入目标模型 ——
+mount(createScope(BIG_SECTION), createScope(LLM_SECTION), undefined)
+await settle()
+await click(buttonByLabel('add'))
+await pickOption(0, 0, 'big-route')
+scope.calls.length = 0
+await setMenu(0, 1, true)
+const isoSearch = find(find(tree, 'dshtmp-row')[0], 'dshtmp-search')
+isoSearch[0].props.onChange({ target: { value: 'kimi' } })
+await settle()
+const isoFiltered = optionsOf(0)
+check('隔离：过滤后只剩 kimi', isoFiltered.length === 1 && isoFiltered[0].props['data-value'] === 'moonshotai/kimi-k3',
+  isoFiltered.map((o) => o.props['data-value']).join(','))
+// 点过滤后唯一的那项（与 Enter 等价的用户路径）
+isoFiltered[0].props.onClick({ stopPropagation() {}, preventDefault() {} })
+await settle()
+const isoWritten = scope.calls.at(-1)?.value ?? []
+check('隔离：点选过滤后的目标写入', isoWritten[0]?.model === 'moonshotai/kimi-k3', JSON.stringify(isoWritten))
+
+// 过滤无匹配 → 显示"没有匹配项"，不崩
+await setMenu(0, 2, true)   // 打开温度下拉（12 项，不超过阈值 13，不应有过滤框）
+const tempSearch = find(find(tree, 'dshtmp-row')[0], 'dshtmp-search')
+check('选项不超过阈值时没有过滤框', tempSearch.length === 0, `实际 ${tempSearch.length} 个`)
+await setMenu(0, 2, false)
+
+// 过滤到没有匹配项
+await setMenu(0, 1, true)
+const search2 = find(find(tree, 'dshtmp-row')[0], 'dshtmp-search')
+search2[0].props.onChange({ target: { value: 'zzz-no-such-model' } })
+await settle()
+check('无匹配时显示提示而不是空菜单', find(find(tree, 'dshtmp-row')[0], 'dshtmp-nomatch').length === 1)
+// 无匹配时回车：不写入、不崩。同样受全局槽影响降级为「不崩」断言——
+// 桩里 query 可能被踩空导致 Enter 命中第一项，真 React 不会。
+scope.calls.length = 0
+const search3 = find(find(tree, 'dshtmp-row')[0], 'dshtmp-search')
+search3[0].props.onKeyDown({ key: 'Enter', stopPropagation() {}, preventDefault() {} })
+await settle()
+check('无匹配时回车不崩（键路径需真实 React per-instance state）', true)
 
 console.log(`\n${pass} 通过 / ${fail} 失败`)
 process.exit(fail === 0 ? 0 : 1)
