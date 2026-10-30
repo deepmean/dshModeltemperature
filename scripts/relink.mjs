@@ -114,8 +114,18 @@ try {
 let ok = false
 try {
   const mod = await import(pathToFileURL(path.join(INSTALLED, 'index.js')).href)
-  ok = typeof mod.apply === 'function' && typeof mod.settingsSchema === 'function'
-  say(ok ? '✓ 从安装位 import 成功（dsh 启动时走的就是这条）' : '⚠️ import 成功但导出不对')
+  /**
+   * The plugin's own exports, not a fixed list of names: `settingsSchema` was
+   * renamed to `Config` when the plugin moved to the native config model, and a
+   * check that still looked for the old name reported a false failure on a
+   * perfectly good link (leaving the backup behind).
+   */
+  const hasApply = typeof mod.apply === 'function'
+  const hasSchema = typeof mod.Config === 'function' || typeof mod.settingsSchema === 'function'
+  ok = hasApply && hasSchema
+  say(ok
+    ? '✓ 从安装位 import 成功（dsh 启动时走的就是这条）'
+    : `⚠️ import 成功但导出不对（apply=${hasApply}, Config=${hasSchema}）`)
 } catch (error) {
   say(`❌ 从安装位 import 失败：${error.message}`)
 }

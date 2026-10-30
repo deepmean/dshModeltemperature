@@ -89,9 +89,78 @@ try {
 check('找得到 @deepseek-ai/dsh', dshPkg !== null, dshPkg === null ? '解析失败' : `v${dshPkg.version}`)
 
 // ─────────────────────────────────────────────────────────────
-// 2. 老式 settings API —— 本次失效的根因
-//    直接 import 真模块看方法在不在，不靠文本匹配
+// 2. 原生契约 —— 插件不依赖任何 dsh-purge 补丁
+//
+//    这里原来检查「legacy settings API 在不在」。插件迁到原生 volatile
+//    Config 之后，那些断言全部失效：它们测的是我们已经不再使用的东西。
+//    现在的契约是下面这些 —— 任何一条红，插件就跑不起来。
 // ─────────────────────────────────────────────────────────────
+const PLUGIN_ENTRY = path.join(PROFILE, 'node_modules', 'dsh-per-model-temperature', 'index.js')
+const pluginSource = fs.existsSync(PLUGIN_ENTRY) ? fs.readFileSync(PLUGIN_ENTRY, 'utf8') : ''
+// 注释要剥掉：文件顶部专门解释了「为什么不再用 ctx.settings.register」，
+// 裸文本匹配会把那段说明当成调用。
+const pluginCode = pluginSource
+  .replace(/\/\*[\s\S]*?\*\//g, '')
+  .replace(/(^|[^:])\/\/[^\n]*/g, '$1')
+
+check(
+  '插件不调用 ctx.settings.register（= 不再依赖 dsh-purge 补丁）',
+  pluginSource !== '' && !/settings\.register\s*\(/.test(pluginCode),
+  pluginSource === '' ? '读不到插件源码' : '',
+  '插件必须只用原生能力；再出现 register 就是把非上游 API 又请回来了。',
+)
+check(
+  '插件不 inject settings',
+  pluginSource !== '' && !/inject\s*=\s*\[[^\]]*['"]settings['"]/.test(pluginCode),
+  '',
+  '原生方案不需要 settings 服务。',
+)
+
+/**
+ * UTF-8 BOM guard.
+ *
+ * A BOM at the head of package.json makes dsh skip the whole plugin with
+ * "SyntaxError: Unexpected token ... is not valid JSON" — and it is easy to
+ * introduce: Windows PowerShell `Set-Content -Encoding UTF8` writes one.
+ * That failure is loud in the boot log but invisible on the settings page,
+ * so it belongs here rather than in a postmortem.
+ */
+for (const file of ["package.json", "index.js", "client.js", "cordis.patch.yml"]) {
+  const full = path.join(PROFILE, "node_modules", "dsh-per-model-temperature", file)
+  if (!fs.existsSync(full)) {
+    check(`${file} 存在`, false)
+    continue
+  }
+  const head = fs.readFileSync(full).subarray(0, 3)
+  const hasBom = head.length === 3 && head[0] === 0xef && head[1] === 0xbb && head[2] === 0xbf
+  check(
+    `${file} 没有 UTF-8 BOM`,
+    !hasBom,
+    hasBom ? "文件以 BOM 开头，dsh 会把整个插件跳过" : "",
+    "用无 BOM 的 UTF-8 重写该文件（[System.IO.File]::WriteAllText 配 UTF8Encoding 的无 BOM 实例）。",
+  )
+}
+// 原生 Config：三个字段都必须 volatile，否则设置页读不到、也写不进。
+let pluginMod = null
+try {
+  pluginMod = await import(pathToFileURL(PLUGIN_ENTRY).href)
+} catch (error) {
+  check('从安装位 import 插件', false, error.message)
+}
+if (pluginMod !== null) {
+  check('插件导出 Config', typeof pluginMod.Config === 'function')
+  const configFields = pluginMod.Config?.dict ?? {}
+  for (const field of ['entries', 'routes', 'models']) {
+    check(
+      `Config.${field} 是 volatile`,
+      configFields[field]?.meta?.volatile === true,
+      JSON.stringify(configFields[field]?.meta ?? null),
+      '非 volatile 字段不会出现在设置页，也写不进去。',
+    )
+  }
+}
+
+// 页面依赖的核心服务：都是 dsh 自带，不是补丁产物。
 let settingsMod = null
 let settingsFile = null
 try {
@@ -100,88 +169,19 @@ try {
 } catch (error) {
   check('载入 dsh-settings', false, error.message)
 }
-check('载入 dsh-settings', settingsMod !== null, settingsFile ?? '解析失败')
-
 if (settingsMod !== null) {
   const Forms = settingsMod.default ?? settingsMod.SettingsForms
   const proto = Forms?.prototype ?? {}
   check('dsh-settings 导出 SettingsForms', typeof Forms === 'function')
-  check(
-    'ctx.settings.register() 存在（插件靠它注册命名空间）',
-    typeof proto.register === 'function',
-    typeof proto.register === 'function' ? '' : '老式 settings API 不见了 —— 上游 0.2.1-alpha.5 起不再自带',
-    FIX_PURGE,
-  )
-  /**
-   * The read side, tested by BEHAVIOUR rather than by matching source text:
-   * call the method on a minimal stand-in that carries one registration and
-   * assert a descriptor comes back with that namespace and its value.
-   *
-   * Why not text-match: a patch revision may wire the rows inline in
-   * describe() or extract a helper — both work, and pinning the literal token
-   * produced a false FAIL against a working 0.2.2 patch.
-   */
-  const schemaStub = { toJSON: () => ({ type: 'object' }), __schema: true }
-  const registration = {
-    ns: 'compat-probe',
-    schema: schemaStub,
-    resolved: { entries: [] },
-    revision: 7,
-    user: { entries: [] },
-    base: undefined,
-    applies: 'live',
-  }
-  const stand = {
-    legacyRegistrations: new Map([['compat-probe', registration]]),
-    commitLegacy: () => { throw new Error('commitLegacy must be reached') },
-  }
-
-  let described = null
-  let describeError = ''
-  try {
-    if (typeof proto.legacyDescriptors === 'function') {
-      described = proto.legacyDescriptors.call(stand)
-    } else if (typeof proto.describe === 'function') {
-      // Inline wiring: describe() needs the full context, which this probe does
-      // not have. Fall back to the source check.
-      described = /legacyRegistrations/.test(String(proto.describe)) ? 'inline' : null
-    }
-  } catch (error) {
-    describeError = error.message
-  }
-  const readsLegacy = described === 'inline'
-    || (Array.isArray(described) && described.some((row) => row?.ns === 'compat-probe' && row?.revision === 7))
-  check(
-    'describe 侧能返回 legacy 命名空间（设置页才读得到值）',
-    readsLegacy,
-    readsLegacy ? '' : (describeError || '未返回 legacy descriptor'),
-    FIX_PURGE,
-  )
-
-  /**
-   * The write side, also by behaviour: mutate() must route a legacy namespace
-   * to commitLegacy instead of falling through to write(), which only knows
-   * configEditor entries and throws "No configurable plugin entry".
-   *
-   * `mutate` is async, so the rejection has to be awaited — without the await
-   * this probe silently compared "" and reported a false failure.
-   */
-  let routed = false
-  let routeError = ''
-  try {
-    await proto.mutate.call(stand, 'compat-probe', [{ op: 'set', path: ['entries'], value: [] }], 7)
-    routeError = 'returned normally without reaching commitLegacy'
-  } catch (error) {
-    if (error.message === 'commitLegacy must be reached') routed = true
-    else routeError = error.message
-  }
-  check(
-    'mutate() 会把 legacy 命名空间的写入路由到 commitLegacy',
-    routed,
-    routed ? '' : (routeError || '没有走到 commitLegacy'),
-    FIX_PURGE,
-  )
+  check('settings.describe 在（页面读值）', typeof proto.describe === 'function')
+  check('settings.mutate 在（页面写值）', typeof proto.mutate === 'function')
 }
+check(
+  'configEditor 可用（服务端写回路由目录）',
+  dshResolve('@deepseek-ai/dsh-config-editor') !== null,
+  '',
+  '没有它就无法把运行时路由发布给页面。',
+)
 
 // ─────────────────────────────────────────────────────────────
 // 3. 注入缝：agent/request waterfall
@@ -292,13 +292,13 @@ if (!fs.existsSync(installedEntry)) {
   check(
     '从已安装路径 import 插件（dsh 启动时走的就是这条）',
     imported !== null,
-    imported !== null ? `apply=${typeof imported.apply} schema=${typeof imported.settingsSchema}` : importError,
+    imported !== null ? `apply=${typeof imported.apply} Config=${typeof imported.Config}` : importError,
     isLink
       ? 'node_modules 是指向源码目录的链接，所以源码目录必须自带 node_modules 才能解析依赖：cd <源码目录> && npm install --omit=dev'
       : '检查插件依赖是否装全。',
   )
   if (imported !== null) {
-    check('插件导出 apply 与 settingsSchema', typeof imported.apply === 'function' && typeof imported.settingsSchema === 'function')
+    check('插件导出 apply 与 Config', typeof imported.apply === 'function' && typeof imported.Config === 'function')
   }
   rows.push({
     label: 'node_modules 的挂载方式',
@@ -312,22 +312,26 @@ if (!fs.existsSync(installedEntry)) {
 }
 
 // ─────────────────────────────────────────────────────────────
-// 7. 运行中的 dsh 是否晚于补丁时间（补丁改了盘，进程要重启才吃得到）
+// 7. 运行中的 dsh 是否加载了当前插件代码
+//
+//    这条原来比的是「补丁文件 mtime」。插件不再依赖补丁之后，真正要紧的是
+//    进程有没有在本插件的 index.js 最后一次修改之后启动：服务端逻辑改了必须
+//    重启；只改 client.js 时刷新页面就够，所以这里不比 client.js。
 // ─────────────────────────────────────────────────────────────
-if (settingsFile !== null) {
-  const patchedAt = fs.statSync(settingsFile).mtimeMs
+if (fs.existsSync(PLUGIN_ENTRY)) {
+  const serverMtime = fs.statSync(PLUGIN_ENTRY).mtimeMs
   let startedAt = null
   try {
     const running = path.join(HOME, 'dsh-config-manager', 'running', 'web.json')
     if (fs.existsSync(running)) startedAt = Date.parse(JSON.parse(fs.readFileSync(running, 'utf8')).startedAt)
   } catch { /* 拿不到就算了 */ }
   if (startedAt === null || Number.isNaN(startedAt)) {
-    check('读得到运行实例的启动时间', false, '跳过「是否晚于补丁」这一条')
+    check('读得到运行实例的启动时间', false, '跳过「进程是否加载了当前代码」这一条')
   } else {
     check(
-      '运行中的 dsh 启动于补丁之后（否则进程里还是旧模块）',
-      startedAt > patchedAt,
-      `进程 ${new Date(startedAt).toLocaleString('zh-CN')}  /  补丁 ${new Date(patchedAt).toLocaleString('zh-CN')}`,
+      '运行中的 dsh 启动于插件代码之后（否则进程里还是旧模块）',
+      startedAt > serverMtime,
+      `进程 ${new Date(startedAt).toLocaleString('zh-CN')}  /  插件 ${new Date(serverMtime).toLocaleString('zh-CN')}`,
       FIX_RESTART,
     )
   }

@@ -105,83 +105,61 @@ npm install --omit=dev
 
 ---
 
-## 更新 dsh 之后（必读）
+## 架构：不依赖任何 dsh 补丁
 
-**每次 `dsh` 更新完，先跑这个：**
+这个插件**只用 dsh 自带的能力**：
+
+| 用到的东西 | 谁提供 | 用途 |
+|---|---|---|
+| `Config`（`.volatile()` 字段） | cordis + schemastery | 存配置，设置页可读写 |
+| `ctx.configForms` → `settings.describe` / `mutate` | dsh-settings（核心） | 设置页读值、写值 |
+| `configEditor.edit` | dsh-config-editor（核心） | 服务端把路由目录写回去 |
+| `agent/request` waterfall | dsh-agent-loop（核心） | 唯一能塞进 temperature 的缝 |
+| `llm.listProviders` / `llm.listModels` | dsh-llm（核心） | 读运行时路由与模型 |
+
+**没有一条来自 `dsh-purge`。** 这一点很关键，因为早期版本靠
+`ctx.settings.register()` —— 那个方法不是 dsh 的代码，是 `dsh-purge` 的
+#42 补丁加上去的。后果是：每次 `dsh update` 覆盖 `node_modules`，补丁被冲掉，
+插件**静默失效**（不报错、不崩溃、没日志，只是功能没了）。这件事发生过三次。
+
+现在插件不再碰它。`check-compat.mjs` 会**在源码层面**断言这一点：
+
+```
+PASS  插件不调用 ctx.settings.register（= 不再依赖 dsh-purge 补丁）
+PASS  插件不 inject settings
+```
+
+### 全新安装的 dsh
+
+不需要任何补丁：
+
+```bash
+git clone https://github.com/deepmean/dshModeltemperature.git
+cd dshModeltemperature && npm install --omit=dev
+dsh plugin --profile web add "file:/绝对路径/dshModeltemperature"
+```
+
+装完启动即可。设置页里会出现「模型温度」，配置存在 profile 的
+`cordis.patch.yml` 里（和所有其它插件一样），不在任何私有文件里。
+
+### 从旧版本迁移
+
+旧版本的记录在 `~/.dsh/settings-legacy.yaml`。插件首次启动时如果发现原生
+config 里**还没有** 记录，会把那份文件里的 `per-model-temperature.entries`
+读出来写进原生 config，且**只做一次**（原生 config 一旦有记录就不再碰，
+不会覆盖你后来的编辑）。
+
+迁移完成后 `settings-legacy.yaml` 里那一节就是死数据了，可以删掉。其余
+section 是别的插件的，别整个删。
+
+### 更新 dsh 之后
 
 ```bash
 node scripts/check-compat.mjs
+node scripts/relink.mjs      # 若 node_modules 被换回实体副本
 ```
 
-一条命令查 23 项，覆盖本插件依赖的每一个上游接口。全绿才算好；有红它会直接告诉你该做什么。
-
-### 为什么需要这一步
-
-本插件站在一条**上游并不保证**的缝上：老式 settings API，也就是 `ctx.settings.register()`。
-
-- dsh `0.2.1-alpha.5` 起，上游的 `dsh-settings` 只剩**新式表单模型**（插件自己的 volatile Config），**`register()` 已经不在上游代码里了**；
-- 本机是靠 **`dsh-purge` 的 #42 号补丁 `SETTINGS_LEGACY_API`** 把它加回来的 —— 该补丁不仅补回 `register()`，还把 legacy 命名空间接进了 `describe()`（客户端读表单）和 `mutate()`（客户端写表单）。
-
-于是就有了这个失败模式：
-
-```
-dsh update  →  覆盖 node_modules 里的文件  →  补丁被冲掉
-           →  ctx.settings.register 变成 undefined
-           →  插件的 apply() 抛 TypeError
-           →  服务端监听器没挂上、设置页没有数据源
-           →  表现：插件「失效」，不报错、不崩溃、没日志
-```
-
-### 怎么修
-
-1. **重新打补丁** —— `dsh-purge` 的 `purge_apply`（#42 等）；
-2. **确认补丁真的进去了** —— 在这种情形下 `purge_apply` 会**什么都不做**：
-
-   ```
-   applied=0, already=60        ← 它以为已打过
-   ```
-
-   它的幂等判断认的是**自己的记录**，不是文件实况。dsh 更新覆盖文件之后，
-   它照样报 already。**这时要看哨兵，别看 `purge_status`。**
-3. **补上漂移的锚点** —— 如果哨兵报 `describe` / `mutate` 那一组红：
-   ```bash
-   node scripts/patch-legacy-hooks.mjs \
-     "C:/softwares/node-arm64/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-settings/lib/index.js"
-   ```
-4. **重启 dsh** —— 补丁改的是磁盘文件，运行中的进程可能还持有旧模块
-   （HMR 有时会自己换掉，但别赌）；
-5. **恢复链接**（用联接方案的话）—— 更新会重跑安装，把链接换成副本：
-   ```bash
-   node scripts/relink.mjs
-   ```
-6. `node scripts/check-compat.mjs` 确认全绿。
-
-`check-compat.mjs` 的最后一条专门验这个：**运行中的 dsh 进程启动时间是否晚于补丁写入时间**。补丁打了但没重启，这条会红。
-
-### 0.2.2-alpha.2 上的真实案例：补丁只装了一半
-
-`purge_apply` 启动时就打印了警告：
-
-```
-[dsh-purge] DSH 0.2.2-alpha.2 未在已验证清单内：仍可应用，写入前备份，
-            应用后请看逐条诊断确认锚点是否漂移。
-```
-
-**锚点确实漂移了。** 0.2.2 的 #42 只装上一半：
-
-| 组件 | 状态 | 后果 |
-|---|---|---|
-| `register()` / `get()` / `commitLegacy()` | ✅ 在 | 服务端注入可用 |
-| `describe()` 返回 legacy 命名空间 | ❌ 缺 | 设置页**读不到**值 |
-| `mutate()` 路由到 `commitLegacy` | ❌ 缺 | 设置页**写不进去**：落进 `write()`，抛 `No configurable plugin entry` |
-
-alpha.5 时代这两处是有的 —— 补丁对 0.2.2 的新代码结构没匹配上，静默漏掉了。
-`patch-legacy-hooks.mjs` 补的就是这两处：新增 `legacyDescriptors()` 并在
-`describe()` 里合并，同时给 `mutate()` 加 legacy 路由。幂等，补过就跳过。
-
-**这也是哨兵为什么要用行为测试而不是文本匹配**：`legacyDescriptors` 这种
-抽取式实现与「直接写在 describe 里」等价，钉死字面量会误报 —— 我一开始就
-这么写，结果对着一个已经修好的补丁报了假红。
+**不需要**重打 purge 补丁，也**不需要**检查 `purge_status`。
 
 ### 为什么链接会被冲掉
 
@@ -251,35 +229,51 @@ dsh 自带 HMR（`dsh-base/cordis.patch.yml` 里的 `hmr` 行，web 部署下默
 
 ## 测试
 
-六个脚本，都不需要浏览器：
+四个脚本，都不需要浏览器：
 
 ```bash
-node scripts/check-compat.mjs             # 23 passed, 0 failed  ← dsh 更新后先跑这个
+node scripts/check-compat.mjs             # 31 passed, 0 failed  ← dsh 更新后先跑这个
+node scripts/probe-native.mjs             # 25 passed, 0 failed
+node scripts/test-temperature-client.mjs  # 87 通过 / 0 失败
+node scripts/probe-live-record.mjs        # 14 passed, 0 failed
 node scripts/relink.mjs                   # 更新后若变成实体副本，用它接回源目录
-node scripts/test-temperature-client.mjs  # 74 通过 / 0 失败
-node scripts/probe-apply-temperature.mjs  # 15 passed, 0 failed
-node scripts/probe-directory.mjs          # 13 passed, 0 failed
-node scripts/probe-live-record.mjs        # 15 passed, 0 failed
 ```
 
-- **`check-compat.mjs`** —— 兼容性哨兵。逐条验上游接口：`dsh-settings` 的 legacy API 是否在（**本次失效的根因**）、`describe()`/`mutate()` 是否接了 legacy 命名空间、`agent/request` waterfall 是否还在、`temperature` 能否活着穿过 `resolveCallWithInfo` 与 pi-ai 转发层、配置数据是否还在、磁盘副本是否与源码一致、**运行中的 dsh 是否启动于补丁之后**。断了会直接给出该做什么。
-- **`test-temperature-client.mjs`** —— 用最小 React 桩把 `client.js` 真跑起来。覆盖「点添加没反应」、「三个字段都是下拉」、「换提供商必须清空模型」、「自定义标记不能串行」、「点菜单滚动条不能把菜单关掉」等曾经真踩过的坑。
-- **`probe-apply-temperature.mjs`** —— 把**已安装的那份** `index.js` 当真模块 import 进来，驱动真实的 `apply()` 监听器，验命中/不命中/多行并存/不改写入参。
-- **`probe-live-record.mjs`** —— 端到端：用 **harness 自己的 yaml 解析器**读真实的 `settings-legacy.yaml`，过**真实的 `settingsSchema`**，再进真实监听器，证明磁盘上那条记录真的会变成发出去的 `temperature`。
-- **`probe-directory.mjs`** —— 验服务端把**活路由表**（`llm.listProviders()`，同步）和**每个路由的模型**（`llm.listModels(route)`，**异步**）发布进设置文档，覆盖「运行时注册的路由也要能选」。含幂等、「某个路由取模型抛错不影响其它」、「宿主不提供 llm 时不抛错」。
-- **`relink.mjs`** —— 把 `node_modules` 里那份插件接回源目录。dsh 更新会重跑安装、把链接换成副本，跑它恢复。「改完即生效」靠的就是这个链接。
+- **`check-compat.mjs`** —— 兼容性哨兵。验的是**现在的契约**：插件没有
+  `ctx.settings.register`（不依赖补丁）、`Config` 三个字段都是 volatile
+  （设置页能读写的前提）、`settings.describe`/`mutate` 与 `configEditor`
+  在、文件没有 UTF-8 BOM（**BOM 会让 dsh 直接跳过整个插件**）、
+  `agent/request` waterfall 还在、`temperature` 能否活着穿过
+  `resolveCallWithInfo` 与 pi-ai 转发层、磁盘副本与源码一致、运行中的 dsh
+  是否启动于当前代码之后。断了会直接给出该做什么。
+- **`probe-native.mjs`** —— 用假宿主驱动真实的 `index.js`：注入语义、
+  volatile 引用与普通对象两种入参、旧配置迁移（含"只迁移一次"）、目录发布
+  （含单路由失败隔离、双重上限、幂等）、宿主缺服务时不抛错。
+- **`test-temperature-client.mjs`** —— 用最小 React 桩把 `client.js` 真跑起来。
+  覆盖「点添加没反应」、「三个字段都是下拉」、「换提供商必须清空模型」、
+  「自定义标记不能串行」、「点菜单滚动条不能把菜单关掉」、长列表过滤与
+  菜单视口定位等曾经真踩过的坑。
+- **`probe-live-record.mjs`** —— 端到端读**你真实的那份配置**（profile 的
+  `cordis.patch.yml`），逐条验证温度会被注入，并确认路由/模型目录已经发布。
+
+`npm test` 会把前四个一起跑。这些脚本优先读**已安装副本**
+（`$DSH_HOME/profiles/<profile>/node_modules/...`），读不到才回退到源码目录；
+可以用 `DSH_HOME` / `DSH_PROFILE_DIR` / `DSH_PACKAGE` 环境变量指到别的部署。
 
 ### 下拉里为什么会有插件自己的路由
 
-`dsh-our-free-model`、`@opencode2dsh/dsh-plugin` 这类插件用 `ctx.llm.registerAdapter()` 在**运行时**注册路由，它们**不在** `llm-pi-ai` 的静态 `providers` 段里。设置页的路由来源有三个，按可信度排：
+`dsh-our-free-model`、`@opencode2dsh/dsh-plugin` 这类插件用
+`ctx.llm.registerAdapter()` 在**运行时**注册路由，它们**不在** `llm-pi-ai`
+的静态 `providers` 段里。设置页的路由来源有三个，按可信度排：
 
-1. **`routes` / `models` 字段** —— 服务端在启动时（以及 `llm/adapters-updated` 时）把活目录写进本插件自己的设置文档。这是主通道：客户端本来就在读这份文档，不依赖 remote API。
-2. **remote 目录** —— `llm/listProviders` + `session/modelCatalog`，能拿到就用，拿不到就跳过。
+1. **`routes` / `models` 字段** —— 服务端在启动时（以及
+   `llm/adapters-updated` 时）把活目录写进本插件自己的 config。这是主通道：
+   客户端本来就在读这份 config，不依赖 remote API。
+2. **remote 目录** —— `llm/listProviders` + `session/modelCatalog`，能拿到就用。
 3. **静态 `llm-pi-ai` 段** —— 兜底，只含手写声明的路由。
 
 三个都没有的部署，下拉末尾还有「自定义提供商…」可以手敲 —— 但正常情况下用不到它。
 
-`npm test` 会把四个一起跑。三个探针优先读**已安装副本**（`$DSH_HOME/profiles/<profile>/node_modules/...`），读不到才回退到源码目录；可以用 `DSH_HOME` / `DSH_PROFILE_DIR` / `DSH_PACKAGE` 环境变量指到别的部署。
 
 ---
 

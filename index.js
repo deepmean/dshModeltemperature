@@ -1,6 +1,5 @@
 /**
- * dsh-per-model-temperature — per-model `temperature` for hand-declared
- * `llm-pi-ai` providers.
+ * dsh-per-model-temperature — per-model `temperature` for llm-pi-ai routes.
  *
  * Why a plugin is needed at all: DSH has no `temperature` field on a provider
  * or model profile. The request field exists (`GenerateOptions.temperature` →
@@ -11,10 +10,28 @@
  * `agent/request` and only then calls `llm.prepareCall()`, so a listener that
  * returns a config carrying `temperature` is what puts it on the wire.
  *
- * Scope, deliberately: this plugin writes exactly one thing — the temperature.
- * Reasoning-effort levels and input modalities live in the provider's own
- * `llm-pi-ai` namespace and are already editable by the Model Capability page,
- * so duplicating them here would create two writers for one key.
+ * ── Why this file looks the way it does ──────────────────────────────────
+ *
+ * CONFIG IS NATIVE. This plugin used to call `ctx.settings.register(...)`, the
+ * "legacy settings API". That method is NOT dsh code: it was added by the
+ * `dsh-purge` patch #42, so the plugin only worked on machines carrying that
+ * patch — and every dsh update overwrote the patched file and silently broke
+ * it. Three separate updates did exactly that.
+ *
+ * Now the plugin declares a plain `Config` schema whose fields are `.volatile()`
+ * and lets cordis own the storage, exactly like `dsh-llm-deepseek` does with its
+ * volatile `models` array. That buys three things:
+ *
+ *   1. No dependency on any patched dsh file. A clean `dsh` install works.
+ *   2. The settings page reads and writes through `ctx.configForms` →
+ *      `settings.describe`/`mutate`, which are core APIs, not patch output.
+ *   3. Values persist in the profile's cordis patch (the same place every other
+ *      plugin keeps its config), not in a private side file.
+ *
+ * `routes` / `models` are published by the server half into its own config so
+ * the page can offer provider routes that only exist at runtime (plugins that
+ * call `ctx.llm.registerAdapter()`), without depending on the remote directory
+ * API being reachable from the settings client.
  *
  * `top_p` / `top_k` are NOT supported and cannot be: neither name exists in
  * `GenerateOptions`, `LlmCallConfig`, or either adapter, and requests are
@@ -25,38 +42,23 @@
 import Schema from '@deepseek-ai/schemastery'
 
 export const name = 'per-model-temperature'
-export const inject = ['settings']
 
-/** Settings namespace owned by this plugin. Must match /^[a-z][a-z0-9-]*$/. */
-export const NAMESPACE = 'per-model-temperature'
-
-/** Upper bound per route for the published model list (see publishDirectory). */
-const MAX_PUBLISHED_MODELS_PER_ROUTE = 40
-
-/** Upper bound across all routes: this list is persisted into the settings file. */
-const MAX_PUBLISHED_MODELS = 400
+/** Profile entry id: also the settings namespace the page talks to. */
+export const ENTRY_ID = 'per-model-temperature'
 
 /**
- * One model's declared temperature, keyed by provider route and model id.
- * @typedef {{ provider: string, model: string, temperature?: number }} PerModelEntry
+ * Plugin config. Every field is volatile, which is what makes it editable from
+ * the settings page: `settings.describe` only lists an entry that has volatile
+ * fields, and `settings.mutate` refuses paths that are not volatile.
  */
-
-/**
- * Plugin settings section.
- *
- * Exported so the end-to-end probe can push the *persisted* record through the
- * same schema the settings service uses at registration time: if validation
- * dropped or coerced the value, the plugin would silently read `entries: []`
- * and the configured temperature would never reach the wire.
- */
-export const settingsSchema = Schema.object({
+export const Config = Schema.object({
   entries: Schema.array(
     Schema.object({
       provider: Schema.string().required(),
       model: Schema.string().required(),
       temperature: Schema.number().min(0).max(2),
     }),
-  ).default([]),
+  ).default([]).volatile(),
   /**
    * Live provider routes, published by the server half — read-only for the UI.
    *
@@ -66,27 +68,47 @@ export const settingsSchema = Schema.object({
    * `our-free-model` and `our-free-model-region`, @opencode2dsh/dsh-plugin
    * registers `opencode2dsh`) never appear there, so those routes were simply
    * not selectable.
-   *
-   * The server half can read them, and it publishes them HERE because this
-   * document is the channel the page already loads successfully — no reliance
-   * on the remote API being reachable from the settings client.
    */
-  routes: Schema.array(Schema.string()).default([]),
+  routes: Schema.array(Schema.string()).default([]).volatile(),
   /** Model ids per route, published alongside {@link routes}. */
   models: Schema.array(
     Schema.object({
       route: Schema.string().required(),
       model: Schema.string().required(),
       /**
-       * Display name from the adapter, when it has one. Channel-gated models are
-       * only identifiable by this: dsh-our-free-model tags its EAC rows in the
-       * name while the ids look ordinary, so a picker built from ids alone made
-       * a complete list look like it held only the free models.
+       * Display name from the adapter, when it has one. Channel-gated models
+       * are only identifiable by this: dsh-our-free-model tags its EAC rows in
+       * the name while the ids look ordinary, so a picker built from ids alone
+       * made a complete list look like it held only the free models.
        */
       name: Schema.string(),
     }),
-  ).default([]),
+  ).default([]).volatile(),
 })
+
+/** Upper bound per route for the published model list (see publishDirectory). */
+const MAX_PUBLISHED_MODELS_PER_ROUTE = 40
+
+/** Upper bound across all routes: this list is persisted with the plugin config. */
+const MAX_PUBLISHED_MODELS = 400
+
+/**
+ * One model's declared temperature, keyed by provider route and model id.
+ * @typedef {{ provider: string, model: string, temperature?: number }} PerModelEntry
+ */
+
+/**
+ * Unwrap a volatile ref, or pass a plain value through.
+ *
+ * Config fields are volatile refs when cordis resolves this plugin's config
+ * (`ref.get()`), but a plain object is what the probes and any non-ref host
+ * hand over. Accepting both keeps the seam testable without a live harness.
+ * @param ref - volatile ref, plain value, or undefined.
+ */
+function valueOf(ref) {
+  if (ref === null || ref === undefined) return undefined
+  return typeof ref.get === 'function' ? ref.get() : ref
+}
 
 /**
  * Return the config without a temperature field. The proposal the loop hands
@@ -127,123 +149,212 @@ export function applyTemperature(entries, config) {
   return { ...config, temperature: entry.temperature }
 }
 
-/**
- * Register the per-model temperature producer.
- * @param ctx - the plugin context; `ctx.settings` must be available.
- */
-export function apply(ctx) {
-  /**
-   * Fail with the actual cause, not a bare TypeError.
-   *
-   * `ctx.settings` is upstream, but `register()` is NOT: dsh 0.2.1-alpha.5's
-   * settings service only exposes the new volatile-Config form model, and this
-   * legacy method is put back by the dsh-purge patch #42 (SETTINGS_LEGACY_API).
-   * A dsh update overwrites `node_modules` and takes it away silently, after
-   * which `ctx.settings.register(...)` throws "is not a function" — a message
-   * that says nothing about why or what to do.
-   */
-  if (typeof ctx.settings?.register !== 'function') {
-    throw new Error(
-      'per-model-temperature: ctx.settings.register() is missing. This plugin uses the legacy settings API, '
-      + 'which upstream dsh no longer ships; the dsh-purge patch #42 (SETTINGS_LEGACY_API) restores it. '
-      + 'Re-apply the purge patches, restart dsh, then diagnose with: node scripts/check-compat.mjs',
-    )
-  }
-  const scope = ctx.settings.register(NAMESPACE, settingsSchema)
-  ctx.on('agent/request', async (_payload, next) => {
-    const config = await next()
-    return applyTemperature(scope.get().entries, config)
-  })
-
-  /**
-   * Publish the live route/model directory into this plugin's own settings
-   * document.
-   *
-   * Both reads are guarded and optional: a deployment without `llm` or without
-   * the session controller simply publishes nothing, and the page keeps
-   * working from the static `llm-pi-ai` section. Writing only on change keeps
-   * the settings file from churning on every boot.
-   */
-  const service = (name) => {
+/** Resolve a service without demanding it in `inject`. */
+function serviceOf(ctx) {
+  return (name) => {
     if (typeof ctx.get !== 'function') return undefined
     try {
-      // Non-strict: return undefined instead of throwing while the providing
-      // fiber is still activating.
+      // Non-strict: undefined instead of throwing while the provider is still
+      // activating.
       return ctx.get(name, false)
     } catch {
       return undefined
     }
   }
+}
+
+/**
+ * Register the per-model temperature producer.
+ *
+ * Nothing here throws: a failure to publish the directory or to migrate the old
+ * side file must not take the plugin (or the harness boot) down with it. The
+ * one thing that must work — the request listener — is registered first and
+ * cannot fail.
+ *
+ * @param ctx - the plugin context.
+ * @param config - resolved plugin config; volatile fields arrive as refs.
+ */
+export function apply(ctx, config) {
+  const service = serviceOf(ctx)
+
+  /** Current entries, from whichever shape the host provided. */
+  const entriesOf = () => {
+    const value = valueOf(config?.entries)
+    return Array.isArray(value) ? value : []
+  }
+
+  ctx.on('agent/request', async (_payload, next) => {
+    const proposal = await next()
+    return applyTemperature(entriesOf(), proposal)
+  })
 
   /**
-   * `llm.listModels()` is async — the adapter resolves it. Reading it
-   * synchronously is exactly why `models` came back empty once: the catalog
-   * helper returns a Promise, and `.groups` on a Promise is always undefined.
+   * Write fields into this plugin's own entry config through the config editor.
    *
-   * Routes come from the synchronous registry; models are fetched per route and
-   * a single failing route never aborts the rest.
+   * This is the native write path (`configEditor.edit(entry, change)`), the one
+   * `dsh-agent-default-model` uses to save a model selection. It needs no
+   * settings service and no patched dsh file. The entry is located by id rather
+   * than through `fiber.entry` so this works identically for a function plugin.
+   *
+   * @param patch - fields to merge into the entry config.
+   * @returns whether the write happened.
    */
-  let publishing = false
-  const publishDirectory = async () => {
-    if (publishing) return
-    publishing = true
+  async function writeConfig(patch) {
+    const editor = service('configEditor')
+    if (editor === undefined || editor === null) return false
+    if (typeof editor.edit !== 'function' || typeof editor.entries !== 'function') return false
+    let entry
     try {
-      const routes = []
-      const models = []
-      const llm = service('llm')
-      if (llm !== undefined && llm !== null && typeof llm.listProviders === 'function') {
-        try {
-          for (const provider of llm.listProviders()) {
-            if (provider !== null && typeof provider === 'object' && typeof provider.id === 'string' && provider.id !== '') {
-              routes.push(provider.id)
-            }
-          }
-        } catch { /* 目录不可用 */ }
-      }
-      routes.sort((a, b) => a.localeCompare(b))
-      if (routes.length === 0) return
-
-      if (typeof llm.listModels === 'function') {
-        for (const route of routes) {
-          if (models.length >= MAX_PUBLISHED_MODELS) break
-          let list
-          try {
-            list = await llm.listModels(route)
-          } catch {
-            continue // 一个路由取不到，不影响其它
-          }
-          if (!Array.isArray(list)) continue
-          let kept = 0
-          for (const model of list) {
-            if (kept >= MAX_PUBLISHED_MODELS_PER_ROUTE || models.length >= MAX_PUBLISHED_MODELS) break
-            if (model !== null && typeof model === 'object' && typeof model.id === 'string' && model.id !== '') {
-              const name = typeof model.name === 'string' && model.name !== '' ? model.name : undefined
-              models.push(name === undefined ? { route, model: model.id } : { route, model: model.id, name })
-              kept += 1
-            }
-          }
-        }
-      }
-      models.sort((a, b) => a.route.localeCompare(b.route) || a.model.localeCompare(b.model))
-
-      const current = scope.get()
-      // Skip the write when nothing moved: this runs on boot and on every
-      // adapter change, and a needless write rewrites settings-legacy.yaml.
-      if (JSON.stringify(current.routes) === JSON.stringify(routes)
-        && JSON.stringify(current.models) === JSON.stringify(models)) return
-      try {
-        await scope.update({ routes, models })
-      } catch { /* 只读部署 */ }
-    } finally {
-      publishing = false
+      entry = editor.entries().find((row) => row?.options?.id === ENTRY_ID)
+    } catch {
+      return false
+    }
+    if (entry === undefined) return false
+    try {
+      await editor.edit(entry, (current) => ({ ...current, ...patch }))
+      return true
+    } catch {
+      return false
     }
   }
 
-  // The adapters this needs are registered by other plugins, so retry across
-  // boot ordering and again whenever an adapter announces a change.
+  /**
+   * Publish the live route/model directory, and migrate the pre-native config.
+   *
+   * Both are best-effort and both run across a few delays: `llm` and the
+   * adapters are provided by other plugins, so boot ordering is not guaranteed.
+   * Writes are skipped when nothing changed — otherwise every boot would
+   * rewrite the profile patch.
+   *
+   * What was last written is remembered here rather than read back from the
+   * config ref: `configEditor.edit` commits the new value to the loader, but the
+   * ref this closure holds may still report the old one until the commit
+   * lands. Comparing against the ref alone therefore rewrote the same content
+   * on the next retry, which is exactly the churn the guard is meant to stop.
+   */
+  let running = false
+  let lastDirectory = null
+  let migrated = false
+  const refresh = async () => {
+    if (running) return
+    running = true
+    try {
+      await migrateLegacyEntries()
+      await publishDirectory()
+    } finally {
+      running = false
+    }
+  }
+
+  /**
+   * One-time move of the old side file into native config.
+   *
+   * Before this migration the entries lived in `settings-legacy.yaml`, owned by
+   * the legacy settings API. That file is left untouched (a rollback might want
+   * it), and the move only happens when the native config still has no entries,
+   * so it cannot overwrite later edits.
+   */
+  async function migrateLegacyEntries() {
+    if (migrated) return
+    if (entriesOf().length > 0) { migrated = true; return }
+    const legacy = service('profileContext')
+    const home = legacy?.home
+    if (typeof home !== 'string' || home === '') return
+    let document
+    try {
+      const { readFileSync } = await import('node:fs')
+      const { join } = await import('node:path')
+      const { parse } = await import('yaml')
+      const path = join(home, 'settings-legacy.yaml')
+      document = parse(readFileSync(path, 'utf8'))
+    } catch {
+      return
+    }
+    const section = document?.[ENTRY_ID]
+    const stored = Array.isArray(section?.entries) ? section.entries : []
+    const entries = stored
+      .filter((row) => row !== null && typeof row === 'object')
+      .map((row) => ({
+        provider: String(row.provider ?? '').trim(),
+        model: String(row.model ?? '').trim(),
+        ...(typeof row.temperature === 'number' ? { temperature: row.temperature } : {}),
+      }))
+      .filter((row) => row.provider !== '' && row.model !== '')
+    if (entries.length === 0) return
+    const ok = await writeConfig({ entries })
+    if (ok) {
+      migrated = true
+      ctx.logger?.info?.(
+        'per-model-temperature: migrated %d entr(ies) out of settings-legacy.yaml into native config',
+        entries.length,
+      )
+    }
+  }
+
+  /** Collect the route/model directory from the live registry and publish it. */
+  async function publishDirectory() {
+    const llm = service('llm')
+    if (llm === undefined || llm === null || typeof llm.listProviders !== 'function') return
+
+    const routes = []
+    try {
+      for (const provider of llm.listProviders()) {
+        if (provider !== null && typeof provider === 'object' && typeof provider.id === 'string' && provider.id !== '') {
+          routes.push(provider.id)
+        }
+      }
+    } catch {
+      return
+    }
+    if (routes.length === 0) return
+    routes.sort((a, b) => a.localeCompare(b))
+
+    const models = []
+    if (typeof llm.listModels === 'function') {
+      for (const route of routes) {
+        if (models.length >= MAX_PUBLISHED_MODELS) break
+        let list
+        try {
+          // Async: the adapter resolves this. A synchronous read here is what
+          // once produced an empty model list with no error at all.
+          list = await llm.listModels(route)
+        } catch {
+          continue // one route failing must not abort the pass
+        }
+        if (!Array.isArray(list)) continue
+        let kept = 0
+        for (const model of list) {
+          if (kept >= MAX_PUBLISHED_MODELS_PER_ROUTE || models.length >= MAX_PUBLISHED_MODELS) break
+          if (model !== null && typeof model === 'object' && typeof model.id === 'string' && model.id !== '') {
+            const label = typeof model.name === 'string' && model.name !== '' ? model.name : undefined
+            models.push(label === undefined ? { route, model: model.id } : { route, model: model.id, name: label })
+            kept += 1
+          }
+        }
+      }
+    }
+    models.sort((a, b) => a.route.localeCompare(b.route) || a.model.localeCompare(b.model))
+
+    const currentRoutes = valueOf(config?.routes)
+    const currentModels = valueOf(config?.models)
+    const sameAsWrite = lastDirectory !== null
+      && JSON.stringify(lastDirectory.routes) === JSON.stringify(routes)
+      && JSON.stringify(lastDirectory.models) === JSON.stringify(models)
+    const sameAsRef = JSON.stringify(currentRoutes) === JSON.stringify(routes)
+      && JSON.stringify(currentModels) === JSON.stringify(models)
+    if (sameAsWrite || sameAsRef) {
+      lastDirectory = { routes, models }
+      return
+    }
+
+    const ok = await writeConfig({ routes, models })
+    if (ok) lastDirectory = { routes, models }
+  }
+
+  // Retry across boot ordering, then again whenever an adapter announces a change.
   for (const delay of [0, 1000, 3000]) {
-    const timer = setTimeout(() => { void publishDirectory() }, delay)
+    const timer = setTimeout(() => { void refresh() }, delay)
     if (typeof timer === 'object' && timer !== null && typeof timer.unref === 'function') timer.unref()
   }
-  ctx.on('llm/adapters-updated', () => { void publishDirectory() })
+  ctx.on('llm/adapters-updated', () => { void refresh() })
 }
