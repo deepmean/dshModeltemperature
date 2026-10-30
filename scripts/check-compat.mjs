@@ -112,16 +112,73 @@ if (settingsMod !== null) {
     typeof proto.register === 'function' ? '' : '老式 settings API 不见了 —— 上游 0.2.1-alpha.5 起不再自带',
     FIX_PURGE,
   )
+  /**
+   * The read side, tested by BEHAVIOUR rather than by matching source text:
+   * call the method on a minimal stand-in that carries one registration and
+   * assert a descriptor comes back with that namespace and its value.
+   *
+   * Why not text-match: a patch revision may wire the rows inline in
+   * describe() or extract a helper — both work, and pinning the literal token
+   * produced a false FAIL against a working 0.2.2 patch.
+   */
+  const schemaStub = { toJSON: () => ({ type: 'object' }), __schema: true }
+  const registration = {
+    ns: 'compat-probe',
+    schema: schemaStub,
+    resolved: { entries: [] },
+    revision: 7,
+    user: { entries: [] },
+    base: undefined,
+    applies: 'live',
+  }
+  const stand = {
+    legacyRegistrations: new Map([['compat-probe', registration]]),
+    commitLegacy: () => { throw new Error('commitLegacy must be reached') },
+  }
+
+  let described = null
+  let describeError = ''
+  try {
+    if (typeof proto.legacyDescriptors === 'function') {
+      described = proto.legacyDescriptors.call(stand)
+    } else if (typeof proto.describe === 'function') {
+      // Inline wiring: describe() needs the full context, which this probe does
+      // not have. Fall back to the source check.
+      described = /legacyRegistrations/.test(String(proto.describe)) ? 'inline' : null
+    }
+  } catch (error) {
+    describeError = error.message
+  }
+  const readsLegacy = described === 'inline'
+    || (Array.isArray(described) && described.some((row) => row?.ns === 'compat-probe' && row?.revision === 7))
   check(
-    'describe() 会把 legacy 命名空间喂给客户端表单',
-    typeof proto.describe === 'function' && /legacyRegistrations/.test(String(proto.describe)),
-    '',
+    'describe 侧能返回 legacy 命名空间（设置页才读得到值）',
+    readsLegacy,
+    readsLegacy ? '' : (describeError || '未返回 legacy descriptor'),
     FIX_PURGE,
   )
+
+  /**
+   * The write side, also by behaviour: mutate() must route a legacy namespace
+   * to commitLegacy instead of falling through to write(), which only knows
+   * configEditor entries and throws "No configurable plugin entry".
+   *
+   * `mutate` is async, so the rejection has to be awaited — without the await
+   * this probe silently compared "" and reported a false failure.
+   */
+  let routed = false
+  let routeError = ''
+  try {
+    await proto.mutate.call(stand, 'compat-probe', [{ op: 'set', path: ['entries'], value: [] }], 7)
+    routeError = 'returned normally without reaching commitLegacy'
+  } catch (error) {
+    if (error.message === 'commitLegacy must be reached') routed = true
+    else routeError = error.message
+  }
   check(
     'mutate() 会把 legacy 命名空间的写入路由到 commitLegacy',
-    typeof proto.mutate === 'function' && /legacyRegistrations/.test(String(proto.mutate)),
-    '',
+    routed,
+    routed ? '' : (routeError || '没有走到 commitLegacy'),
     FIX_PURGE,
   )
 }

@@ -1,4 +1,4 @@
-﻿# dsh-per-model-temperature
+# dsh-per-model-temperature
 
 给 [DeepSeek Harness](https://github.com/deepseek-ai/dsh) 用的**按模型温度**插件：在设置页里给每一条 `llm-pi-ai` 路由的每个模型单独配一个 `temperature`，并在请求真正发出去之前把它塞进去。
 
@@ -135,14 +135,53 @@ dsh update  →  覆盖 node_modules 里的文件  →  补丁被冲掉
 ### 怎么修
 
 1. **重新打补丁** —— `dsh-purge` 的 `purge_apply`（#42 等）；
-2. **重启 dsh** —— 补丁改的是磁盘文件，运行中的进程还持有旧模块，必须重启才吃得到；
-3. **恢复链接**（用联接方案的话）—— 更新会重跑安装，把链接换成副本：
+2. **确认补丁真的进去了** —— 在这种情形下 `purge_apply` 会**什么都不做**：
+
+   ```
+   applied=0, already=60        ← 它以为已打过
+   ```
+
+   它的幂等判断认的是**自己的记录**，不是文件实况。dsh 更新覆盖文件之后，
+   它照样报 already。**这时要看哨兵，别看 `purge_status`。**
+3. **补上漂移的锚点** —— 如果哨兵报 `describe` / `mutate` 那一组红：
+   ```bash
+   node scripts/patch-legacy-hooks.mjs \
+     "C:/softwares/node-arm64/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-settings/lib/index.js"
+   ```
+4. **重启 dsh** —— 补丁改的是磁盘文件，运行中的进程可能还持有旧模块
+   （HMR 有时会自己换掉，但别赌）；
+5. **恢复链接**（用联接方案的话）—— 更新会重跑安装，把链接换成副本：
    ```bash
    node scripts/relink.mjs
    ```
-4. `node scripts/check-compat.mjs` 确认全绿。
+6. `node scripts/check-compat.mjs` 确认全绿。
 
 `check-compat.mjs` 的最后一条专门验这个：**运行中的 dsh 进程启动时间是否晚于补丁写入时间**。补丁打了但没重启，这条会红。
+
+### 0.2.2-alpha.2 上的真实案例：补丁只装了一半
+
+`purge_apply` 启动时就打印了警告：
+
+```
+[dsh-purge] DSH 0.2.2-alpha.2 未在已验证清单内：仍可应用，写入前备份，
+            应用后请看逐条诊断确认锚点是否漂移。
+```
+
+**锚点确实漂移了。** 0.2.2 的 #42 只装上一半：
+
+| 组件 | 状态 | 后果 |
+|---|---|---|
+| `register()` / `get()` / `commitLegacy()` | ✅ 在 | 服务端注入可用 |
+| `describe()` 返回 legacy 命名空间 | ❌ 缺 | 设置页**读不到**值 |
+| `mutate()` 路由到 `commitLegacy` | ❌ 缺 | 设置页**写不进去**：落进 `write()`，抛 `No configurable plugin entry` |
+
+alpha.5 时代这两处是有的 —— 补丁对 0.2.2 的新代码结构没匹配上，静默漏掉了。
+`patch-legacy-hooks.mjs` 补的就是这两处：新增 `legacyDescriptors()` 并在
+`describe()` 里合并，同时给 `mutate()` 加 legacy 路由。幂等，补过就跳过。
+
+**这也是哨兵为什么要用行为测试而不是文本匹配**：`legacyDescriptors` 这种
+抽取式实现与「直接写在 describe 里」等价，钉死字面量会误报 —— 我一开始就
+这么写，结果对着一个已经修好的补丁报了假红。
 
 ### 为什么链接会被冲掉
 
