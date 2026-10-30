@@ -93,6 +93,16 @@ const MAX_PUBLISHED_MODELS_PER_ROUTE = 40
 const MAX_PUBLISHED_MODELS = 400
 
 /**
+ * How long boot is treated as incomplete for directory publishing.
+ *
+ * Adapters register over the first seconds of their own startup, so an early
+ * read of the registry returns a subset. Publishing that subset replaced a good
+ * 30-route directory with the 2 routes dsh itself owns, and wiped the model
+ * list — see `publishDirectory`.
+ */
+const SETTLE_MS = 15000
+
+/**
  * One model's declared temperature, keyed by provider route and model id.
  * @typedef {{ provider: string, model: string, temperature?: number }} PerModelEntry
  */
@@ -235,6 +245,15 @@ export function apply(ctx, config) {
   let running = false
   let lastDirectory = null
   let migrated = false
+  /**
+   * When boot started, and whether adapters have had time to register.
+   *
+   * `llm.listProviders()` answers from a live registry that other plugins fill
+   * in during their own startup, so an early read is legitimately incomplete.
+   * See `publishDirectory` for what depends on this.
+   */
+  const bootAt = Date.now()
+  const settled = () => Date.now() - bootAt > SETTLE_MS
   const refresh = async () => {
     if (running) return
     running = true
@@ -309,6 +328,19 @@ export function apply(ctx, config) {
     if (routes.length === 0) return
     routes.sort((a, b) => a.localeCompare(b))
 
+    /**
+     * Never shrink on an early snapshot.
+     *
+     * Adapters register over the first seconds of boot — at the first tick only
+     * dsh's own two adapters exist. Publishing that snapshot replaced a good
+     * 30-route directory with 2 routes and wiped the model list, which is
+     * exactly the "dropdown is empty again" failure the directory exists to
+     * prevent. Until the boot has settled, a set smaller than what is already
+     * stored is treated as incomplete and skipped.
+     */
+    const storedRoutes = Array.isArray(valueOf(config?.routes)) ? valueOf(config.routes) : []
+    if (!settled() && routes.length < storedRoutes.length) return
+
     const models = []
     if (typeof llm.listModels === 'function') {
       for (const route of routes) {
@@ -352,7 +384,7 @@ export function apply(ctx, config) {
   }
 
   // Retry across boot ordering, then again whenever an adapter announces a change.
-  for (const delay of [0, 1000, 3000]) {
+  for (const delay of [0, 1000, 3000, 8000, 16000]) {
     const timer = setTimeout(() => { void refresh() }, delay)
     if (typeof timer === 'object' && timer !== null && typeof timer.unref === 'function') timer.unref()
   }

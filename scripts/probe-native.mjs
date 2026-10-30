@@ -266,6 +266,30 @@ function freshCtx(options) {
   check('上限：每路由最多 40 个模型', (written.models ?? []).length === 40, String((written.models ?? []).length))
 }
 
+// 早期快照不得缩小已发布的目录
+{
+  /**
+   * 真实事故：临时实例在适配器注册完之前发布，把 30 个路由覆盖成 dsh 自带的
+   * 2 个，顺带清空了模型列表 —— 正是"下拉又空了"。启动期读到的是子集，
+   * 所以「比已有更小」必须被视为不完整而跳过。
+   */
+  const llm = {
+    listProviders: () => [{ id: 'deepseek-account' }, { id: 'deepseek-official' }],
+    listModels: async () => [{ id: 'm' }],
+  }
+  const storedRoutes = []
+  for (let i = 0; i < 30; i++) storedRoutes.push(`route-${i}`)
+  const editor = editorStub({ entries: [], routes: storedRoutes, models: [] })
+  const ctx = freshCtx({ configEditor: editor, llm })
+  mod.apply(ctx, { entries: ref([]), routes: ref(storedRoutes), models: ref([]) })
+  await new Promise((r) => setTimeout(r, 80))
+  check(
+    '启动早期的子集不覆盖已发布目录（不缩小）',
+    editor.state.writes.length === 0,
+    JSON.stringify(editor.state.writes.map((w) => w.routes)),
+  )
+}
+
 // ── 8. 缺服务时不抛 ─────────────────────────────────────────────
 {
   let threw = null
